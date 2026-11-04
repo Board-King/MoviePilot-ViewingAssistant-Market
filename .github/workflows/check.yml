@@ -18,6 +18,6 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m unittest discover -s tests -p "test_*.py" -v
-      - run: node --test tests/config_flow.cjs tests/federation.test.mjs
+      - run: node --test tests/config_flow.cjs tests/federation.test.mjs tests/tonight.test.mjs tests/library-picker.test.mjs
       - run: python tools/build.py
       - run: python tools/build.py --verify

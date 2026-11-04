@@ -170,7 +170,9 @@ def get_form_fields(server_options):
         fields.insert(1, _node("VAlert", props={"type": "info", "variant": "tonal", "density": "compact",
                                              "class": "mb-4",
                                              "text": "暂无可选的 Emby 连接，请先在 MoviePilot 配置并启用媒体服务器。"}))
-    return [_card("观影偏好", fields)]
+    card = _card("观影偏好", fields)
+    card["props"]["data-va-binding"] = True
+    return [card]
 
 
 def _features(baseline, name, limit):

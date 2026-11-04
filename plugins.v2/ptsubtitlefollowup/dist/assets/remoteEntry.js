@@ -113,6 +113,12 @@ function renderNode(Vue, node, ctx = {}) {
     const flag = /^\{\{\s*(\w+)\s*\}\}$/.exec(condition)
     if (!(eq ? ctx.model?.[eq[1]] === eq[2] : flag && ctx.model?.[flag[1]] === true)) return null
   }
+  if (key === 'fusion_user_id' && ctx.renderAccountField) return ctx.renderAccountField()
+  if (key === 'fusion_library_ids' && ctx.libraryPicker) {
+    const {fusion_server_ref:server, fusion_user_id:user} = ctx.model
+    return Vue.h(ctx.libraryPicker,{key:JSON.stringify([server,user]),server,user,value:ctx.model[key],
+      api:ctx.api,pluginId:ctx.pluginId,fieldProps:ctx.fieldProps(key),onChange:value=>ctx.setField(key,value)})
+  }
   if (key && ctx.setField) {
     Object.assign(props, ctx.fieldProps?.(key) || {}, {
       'data-model-key': key, modelValue: ctx.model[key],
@@ -131,6 +137,7 @@ function renderNode(Vue, node, ctx = {}) {
 
 // The page never starts a task on mount. Refresh/authorization need a user click.
 function makePage(Vue, pluginId) {
+  const Tonight = makeTonight(Vue)
   const Shelf = makeShelf(Vue)
   const SubtitleRail = makeSubtitleRail(Vue)
   const Support = makeSupport(Vue)
@@ -146,7 +153,7 @@ function makePage(Vue, pluginId) {
       function settings(target) {
         if (!props.show_switch || busy.value) return
         vaLeaveBoard({selection:{...selection},top:scroller.value?.scrollTop || 0,
-          target:target === 'ranked' ? 'ranked' : undefined})
+          target:['ranked','tonight'].includes(target) ? target : undefined})
         emit('switch')
       }
       function shelfReady(newSelection) {
@@ -209,6 +216,8 @@ function makePage(Vue, pluginId) {
           vaHeader(Vue,'观影助手',()=>emit('close'),false),
           h('div',{ref:scroller,class:'va-scroll pa-4'}, [
             !rows.value && !error.value ? h('div',{role:'status',class:'py-4'},'正在读取看板…') : null,
+            rows.value ? h(Tonight,{key:'tonight',api:props.api,pluginId,initial:rows.value,
+              onSettings:props.show_switch ? settings : undefined}) : null,
             ...(rows.value || []).map(row => row.props?.['data-va-shelf']
               ? h(Shelf,{key:'shelf', initial:row,api:props.api,pluginId,resume:resume?.selection,onReady:shelfReady})
               : renderNode(Vue,row,{pluginId, SubtitleRail, busy:busy.value,toolbarPrimary:true,onAction:action,
@@ -386,6 +395,179 @@ function makeShelf(Vue) {
   }
 }
 
+const vaTonightStyle = `
+.va-tonight{padding:16px;border-radius:8px;border:1px solid rgba(var(--v-border-color),var(--v-border-opacity));background:rgb(var(--v-theme-surface));margin-bottom:16px}
+.va-tonight header,.va-tonight-controls,.va-tonight-filters,.va-tonight-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px 12px}
+.va-tonight header{justify-content:space-between;gap:10px}
+.va-tonight-controls{gap:4px}
+.va-tonight-filters{margin-top:12px;padding:8px 0;border-top:1px solid rgba(var(--v-theme-on-surface),.10)}
+.va-tonight-filters label{display:inline-flex;align-items:center;gap:6px;min-height:36px}
+.va-tonight-filters select{color:inherit;border:1px solid rgba(var(--v-theme-on-surface),.28);border-radius:6px;padding:4px 8px;background:rgb(var(--v-theme-surface));appearance:auto}
+.va-tonight-filters input{accent-color:rgb(var(--v-theme-primary))}
+.va-tonight-results{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr));gap:8px;list-style:none;margin-top:12px;padding:0}
+.va-tonight-pick{display:flex;flex-direction:column;align-items:start;gap:4px;min-width:0;padding:10px 12px;background:rgba(var(--v-theme-on-surface),.04);border-radius:8px;overflow-wrap:anywhere}
+.va-tonight-pick strong{font-size:.95rem}.va-tonight-meta{gap:2px 7px;font-size:.75rem;color:rgba(var(--v-theme-on-surface),.75)}
+.va-tonight-meta>span{white-space:nowrap}.va-tonight-meta>span+span:before{content:'·';margin-inline-end:7px}
+.va-tonight-pick a{display:inline-flex;align-items:center;min-height:32px;margin-top:4px;padding:3px 8px;border-radius:6px;font-size:.8125rem;font-weight:500;color:rgb(var(--v-theme-primary));background:rgba(var(--v-theme-primary),.09);text-decoration:none}
+.va-tonight-pick a:hover{background:rgba(var(--v-theme-primary),.16)}
+.va-tonight-message{margin-top:8px;font-size:.85rem}
+@media(pointer:coarse){.va-tonight :is(button,a,select){min-height:44px}}
+`
+
+// Emby details links come from the bound server. Keep browser links limited
+// to this contract so media URLs, credentials or extra parameters never leak.
+function vaTonightLink(raw, itemId) {
+  if (typeof raw !== 'string' || typeof itemId !== 'string' || !/^[\w-]{1,128}$/.test(itemId)) return null
+  try {
+    const url = new URL(raw)
+    const route = /^#!\/item\?(.+)$/.exec(url.hash)
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search ||
+        !url.pathname.endsWith('/web/index.html') || !route) return null
+    const query = new URLSearchParams(route[1])
+    if (Array.from(query).length !== 3 || query.get('id') !== itemId || query.get('context') !== 'home' ||
+        !/^[\w-]{1,128}$/.test(query.get('serverId') || '')) return null
+    return url.href
+  } catch { return null }
+}
+
+function makeTonight(Vue) {
+  const {h, ref, watch, onUnmounted, resolveComponent} = Vue
+  const messages = {
+    SETUP_REQUIRED:'先在观影偏好中绑定 Emby 用户并选择媒体库。',
+    VERIFY_REQUIRED:'已保存的 Emby 用户需要验证后才能选片。',
+    VERIFY_FAILED:'绑定验证未通过，请检查 Emby 用户和可见媒体库。',
+    SCOPE_REQUIRED:'请在观影偏好中选择允许使用的媒体库。',
+    LIBRARY_NOT_VISIBLE:'已选媒体库的权限发生变化，请重新选择。',
+    FORBIDDEN:'当前账号没有查看这份个人片单的权限。',
+    SIGN_IN:'请重新登录 MoviePilot，再打开个人片单。',
+    BUSY:'片单正在读取，请稍后再试。',
+    RATE_LIMITED:'Emby 暂时限流，请稍后再试。',
+    UNAVAILABLE:'暂时读不到片单，请稍后再试。',
+  }
+  return {
+    name:'ViewingAssistantTonight', props:['api','pluginId','initial','onSettings'],
+    setup(props) {
+      const maxMinutes = ref(0), chinese = ref(false), filtersOpen = ref(false)
+      const durationInput = ref(null)
+      const items = ref(null), limited = ref(false), pending = ref(''), reason = ref('')
+      let generation = 0, controller
+      function reset() {
+        generation++
+        controller?.abort()
+        controller = null
+        pending.value = ''; reason.value = ''; items.value = null; limited.value = false
+      }
+      watch(() => props.initial, reset)
+      onUnmounted(reset)
+      function changeFilter(field, value) {
+        if (pending.value === 'validate' || field.value === value) return
+        reset()
+        field.value = value
+      }
+      function toggleFilters() {
+        filtersOpen.value = !filtersOpen.value
+        if (filtersOpen.value) Vue.nextTick(() => durationInput.value?.focus())
+      }
+      async function read(verify = false) {
+        if (pending.value) return
+        reset()
+        const stamp = generation, path = 'plugin/' + props.pluginId + '/fusion/'
+        controller = new AbortController()
+        try {
+          if (verify) {
+            pending.value = 'validate'
+            const binding = await props.api.post(path + 'validate', {})
+            if (stamp !== generation) return
+            if (binding?.success !== true) { reason.value = 'VERIFY_FAILED'; return }
+          }
+          pending.value = 'read'
+          const result = await props.api.get(path + 'tonight', {params:{
+            max_minutes:maxMinutes.value, chinese_subtitles:chinese.value
+          }, signal:controller.signal})
+          if (stamp !== generation) return
+          if (result?.success !== true) {
+            reason.value = Object.hasOwn(messages, result?.reason) ? result.reason : 'UNAVAILABLE'
+            return
+          }
+          if (!Array.isArray(result.items) || result.items.length > 3 || result.items.some(
+            item => !item || typeof item.id !== 'string' || typeof item.title !== 'string' || !item.title.trim()
+          )) throw Error('invalid picks')
+          items.value = result.items
+          limited.value = result.limited === true
+        } catch (error) {
+          if (stamp !== generation) return
+          const status = error?.response?.status ?? error?.status
+          reason.value = status === 401 ? 'SIGN_IN' : status === 403 ? 'FORBIDDEN' : 'UNAVAILABLE'
+        } finally {
+          if (stamp === generation) { controller = null; pending.value = '' }
+        }
+      }
+      function pick(item) {
+        const url = vaTonightLink(item.url, item.id)
+        const meta = []
+        if (Number.isInteger(item.year)) meta.push(String(item.year))
+        if (Number.isInteger(item.minutes) && item.minutes > 0) meta.push(item.minutes + ' 分钟')
+        if (item.chinese_subtitles === true) meta.push('中文字幕')
+        if (Number.isFinite(item.score) && item.score >= 0 && item.score <= 100) meta.push('口味 ' + item.score)
+        return h('li',{class:'va-tonight-pick',key:item.id},[
+          h('strong',item.title),
+          meta.length ? h('span',{class:'va-tonight-meta'},meta.map(text => h('span',text))) : null,
+          item.version ? h('small','版本 · ' + item.version) : null,
+          item.reason ? h('small',item.reason) : null,
+          url ? h('a',{href:url,target:'_blank',rel:'noopener noreferrer',
+            'aria-label':'在 Emby 打开《' + item.title + '》'},'在 Emby 打开 ↗') :
+            h('small',{class:'text-medium-emphasis'},'请在 Emby 中查找此片')
+        ])
+      }
+      return () => {
+        const needsSetup = ['SETUP_REQUIRED','VERIFY_FAILED','SCOPE_REQUIRED','LIBRARY_NOT_VISIBLE'].includes(reason.value)
+        const needsVerify = reason.value === 'VERIFY_REQUIRED'
+        const setup = needsSetup && props.onSettings
+        const hasFilters = maxMinutes.value > 0 || chinese.value
+        const widen = items.value?.length === 0 && hasFilters
+        const denied = reason.value === 'SIGN_IN' || reason.value === 'FORBIDDEN'
+        const filterText = [maxMinutes.value ? maxMinutes.value + ' 分钟内' : '', chinese.value ? '中文字幕' : '']
+          .filter(Boolean).join(' · ')
+        const btn = (label, attrs) => h(resolveComponent('VBtn'),{size:'small',...attrs},{default:()=>label})
+        const empty = hasFilters ? '没有找到符合这些条件的电影，可以放宽筛选。' : '这次没有找到可推荐的电影。'
+        return h('section',{class:'va-tonight','aria-label':'今晚看什么'},[
+          h('style',vaTonightStyle),
+          h('header',[
+            h('div',[h('h2',{class:'text-subtitle-1 font-weight-bold'},'今晚看什么'),
+              h('p',{class:'text-caption text-medium-emphasis'},'从我的 Emby 片库挑选，最多三部。')]),
+            denied ? null : h('div',{class:'va-tonight-controls'},[
+              btn(filterText || '筛选',{variant:'text','aria-expanded':filtersOpen.value,
+                'aria-label':filterText ? '筛选：' + filterText : '筛选',onClick:toggleFilters}),
+              btn(setup ? '设置观影偏好' : needsVerify ? '验证绑定' : reason.value ? '重试' :
+                  widen ? '不限条件再挑' : items.value ? '刷新片单' : '帮我挑片',{
+                color:'primary',variant:'flat',loading:!!pending.value,disabled:!!pending.value,
+                onClick:()=>{
+                  if (setup) return props.onSettings('tonight')
+                  if (widen) { maxMinutes.value=0; chinese.value=false }
+                  return read(needsVerify)
+                }})
+            ])
+          ]),
+          filtersOpen.value && !denied ? h('div',{class:'va-tonight-filters',role:'group','aria-label':'本次选片条件'},[
+            h('label',['片长', h('select',{ref:durationInput,value:maxMinutes.value,disabled:pending.value==='validate',
+              onChange:e=>changeFilter(maxMinutes,Number(e.target.value))},
+              [0,90,100,120].map(n=>h('option',{value:n},n ? n+' 分钟以内' : '不限')))]),
+            h('label',[h('input',{type:'checkbox',checked:chinese.value,disabled:pending.value==='validate',
+              onChange:e=>changeFilter(chinese,e.target.checked)}),'仅有中文字幕'])
+          ]) : null,
+          h('div',{role:'status','aria-live':'polite'},[
+            reason.value ? h('p',{class:'va-tonight-message'},messages[reason.value]) : null,
+            pending.value ? h('p',{class:'va-tonight-message'},pending.value === 'validate' ? '正在验证绑定…' : '正在片库中挑选…') : null,
+            items.value ? (items.value.length ? h('ol',{class:'va-tonight-results'},items.value.map(pick)) :
+              h('p',{class:'va-tonight-message'},empty)) : null,
+            limited.value ? h('small',{class:'text-medium-emphasis'},'本次只核对了部分片库。') : null
+          ])
+        ])
+      }
+    }
+  }
+}
+
 function makeSubtitleRail(Vue) {
   const {h, ref, computed, watch} = Vue
   const kinds = {
@@ -537,26 +719,109 @@ function makeSupport(Vue) {
   };
 }
 
+function makeLibraryPicker(Vue) {
+  const {h,ref,onUnmounted,resolveComponent} = Vue
+  return {
+    name:'ViewingAssistantLibraryPicker',
+    props:['api','pluginId','server','user','value','fieldProps'],
+    emits:['change'],
+    setup(props,{emit}) {
+      const options = ref(null), manual = ref(false), busy = ref(false), note = ref('')
+      let active = true, request = 0
+      onUnmounted(()=>{ active = false })
+      const selected = () => Array.isArray(props.value) ? props.value :
+        typeof props.value === 'string' ? props.value.split(/[\s,]+/).filter(Boolean) : []
+      async function read() {
+        const server = props.server, user = vaEmbyAccountId(props.user)
+        if (busy.value || !server || !user || props.fieldProps?.disabled) return
+        const turn = ++request
+        busy.value = true; manual.value = false; note.value = ''
+        const current = () => active && turn === request && props.server === server && vaEmbyAccountId(props.user) === user
+        try {
+          const result = await props.api.get('plugin/' + props.pluginId + '/fusion/binding/libraries',
+            {params:{server_ref:server,user_id:user}})
+          if (!current()) return
+          if (result?.success !== true || !Array.isArray(result.libraries) || result.libraries.some(item =>
+            !item || typeof item.id !== 'string' || !/^[\w-]{1,80}$/.test(item.id) ||
+            typeof item.name !== 'string' || !item.name.trim()
+          )) throw Error('Invalid directory')
+          options.value = result.libraries.map(item=>({title:item.name,value:item.id}))
+          if (!options.value.length) note.value = '此账号没有可选的影视库。'
+        } catch {
+          if (current()) note.value = '读取媒体库失败，可以重试或手动填写 ID。'
+        } finally { if (current()) busy.value = false }
+      }
+      function toggleManual() {
+        if (props.fieldProps?.disabled) return
+        request++; busy.value=false; note.value=''
+        manual.value=!manual.value
+        if (!manual.value && !options.value?.length) read()
+      }
+      const button = (text,onClick,props={}) => h(resolveComponent('VBtn'),
+        {size:'small',variant:'text',...props,onClick},{default:()=>text})
+      return () => {
+        const field = props.fieldProps || {}, ids = selected()
+        const list = options.value
+        const server = props.server, user = vaEmbyAccountId(props.user)
+        const input = manual.value ?
+          h(resolveComponent('VTextarea'),{...field,label:'指定媒体库 ID',rows:2,hint:'用换行或逗号分隔',
+            modelValue:Array.isArray(props.value) ? ids.join(', ') : props.value || '',
+            'onUpdate:modelValue':v=>{if (active && !field.disabled && manual.value) emit('change',v)}}) :
+          list?.length ? h(resolveComponent('VSelect'),{
+            ...field,label:'指定媒体库',multiple:true,chips:true,closableChips:true,
+            items:[...list,...ids.filter(id=>!list.some(item=>item.value===id)).map(value=>({title:'当前未列出 · '+value,value}))],
+            itemTitle:'title',itemValue:'value',modelValue:ids,
+            'onUpdate:modelValue':values=>{
+              if (!active || props.fieldProps?.disabled || manual.value || options.value!==list ||
+                  props.server!==server || vaEmbyAccountId(props.user)!==user || !Array.isArray(values)) return
+              if (values.every(id=>list.some(item=>item.value===id) || selected().includes(id)))
+                emit('change', [...new Set(values)].join(','))
+            }
+          }) : button(note.value?'重新读取媒体库':ids.length?'更改指定媒体库':'选择媒体库',read,
+            {color:'primary',variant:'tonal',loading:busy.value,disabled:field.disabled || busy.value || !server || !user})
+        return h('div',{'data-model-key':'fusion_library_ids'},[
+          input,
+          !manual.value && !list?.length && ids.length ? h('span',{class:'ms-2 text-caption'},'已选 '+ids.length+' 个') : null,
+          button(manual.value?'按名称选择':'手动填写 ID',toggleManual,{size:'x-small',disabled:field.disabled}),
+          note.value ? h('div',{role:'status',class:'text-caption mt-1'},note.value) : null
+        ])
+      }
+    }
+  }
+}
+
 // MoviePilot owns loading and persistence; the plugin owns when its draft may be saved.
+function vaEmbyAccountId(value) {
+  if (typeof value !== 'string' || !/^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(value)) return ''
+  return value.replace(/-/g, '').toLowerCase()
+}
+
+function vaBindingIssues(draft) {
+  const issues = []
+  if (draft.fusion_enabled !== true) issues.push({key:'fusion_enabled', text:'打开观影偏好更新'})
+  const server = draft.fusion_server_ref
+  if (typeof server !== 'string' || !server || server.trim() !== server || Array.from(server).length > 200 ||
+      /[\p{C}\p{Z}]/u.test(server.replace(/ /g, '')))
+    issues.push({key:'fusion_server_ref', text:'选择 Emby 服务器'})
+  if (!vaEmbyAccountId(draft.fusion_user_id)) issues.push({key:'fusion_user_id', text:'选择 Emby 账号'})
+  if (!['selected_ids','all_visible'].includes(draft.fusion_library_mode))
+    issues.push({key:'fusion_library_mode', text:'选择授权媒体库'})
+  if (draft.fusion_library_mode === 'selected_ids') {
+    const raw = draft.fusion_library_ids
+    const ids = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.trim().split(/[\s,]+/) : []
+    if (!ids.length || ids.length > 100 || !ids.every(x => typeof x === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(x)))
+      issues.push({key:'fusion_library_ids',text:'填写有效的媒体库 ID'})
+  }
+  return issues
+}
+
 function draftIssues(draft) {
   if (draft.fusion_execution_enabled !== true) return []
-  const issues = []
+  const issues = vaBindingIssues(draft)
   const need = (ok, key, text) => { if (!ok) issues.push({ key, text }) }
   const source = 'tmdb_popular_movie'
   const plain = (value, limit) => typeof value === 'string' && value.trim() === value &&
     value.length > 0 && Array.from(value).length <= limit && !/[\p{C}\p{Z}]/u.test(value.replace(/ /g, ''))
-  need(draft.fusion_enabled === true, 'fusion_enabled', '打开观影偏好更新')
-  need(plain(draft.fusion_server_ref, 200), 'fusion_server_ref', '选择 Emby 服务器')
-  const id = typeof draft.fusion_user_id === 'string' ? draft.fusion_user_id.replace(/-/g, '') : ''
-  need(/^[a-f0-9]{32}$/i.test(id), 'fusion_user_id', '填写 32 位 Emby 用户 ID')
-  const range = draft.fusion_library_mode
-  need(['selected_ids', 'all_visible'].includes(range), 'fusion_library_mode', '选择授权媒体库')
-  if (range === 'selected_ids') {
-    const raw = draft.fusion_library_ids
-    const ids = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.trim().split(/[\s,]+/) : []
-    need(ids.length > 0 && ids.length <= 100 && ids.every(x => typeof x === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(x)),
-      'fusion_library_ids', '填写有效的媒体库 ID')
-  }
   need(draft.fusion_discovery_enabled === true, 'fusion_discovery_enabled', '打开候选更新')
   need(Array.isArray(draft.fusion_discovery_sources) && draft.fusion_discovery_sources.includes(source),
     'fusion_discovery_sources', '候选来源加入 TMDB 热门电影')
@@ -598,6 +863,7 @@ function vaReviewScope(nodes, path) {
 }
 
 function makeConfig(Vue, renderNode, Support, pluginId) {
+  const LibraryPicker = makeLibraryPicker(Vue)
   const { h, ref, computed, onMounted, onUnmounted, nextTick, resolveComponent } = Vue
   const copy = value => JSON.parse(JSON.stringify(value))
   const resultText = {
@@ -612,11 +878,15 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
     setup(props, { emit }) {
       const boardBookmark = vaTakeHandoff('config')
       let openRankedDraft = boardBookmark?.target === 'ranked'
+      const tonightSetup = boardBookmark?.target === 'tonight'
       const draft = ref({}), form = ref([]), loaded = ref(false), busy = ref(false)
       const message = ref(''), serverIssue = ref(null), review = ref(null), saved = ref(false), conflict = ref(false)
       const container = ref(null)
       const scopeRegion = ref(null), deliberate = ref(false)
-      let alive = true, original = '', guardTimer
+      const accounts = ref(null), accountError = ref(''), loadingAccounts = ref(false), manualAccount = ref(false)
+      const nextBinding = computed(() => tonightSetup ? vaBindingIssues(draft.value)[0] : null)
+      const personalSetup = computed(() => tonightSetup && draft.value.fusion_execution_enabled !== true)
+      let alive = true, original = '', guardTimer, directoryRequest = 0
       onUnmounted(() => { alive = false; clearTimeout(guardTimer) })
       const issues = computed(() => [...draftIssues(draft.value), ...(serverIssue.value ? [serverIssue.value] : [])])
       const path = 'plugin/' + pluginId
@@ -625,9 +895,67 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         { variant: 'text', size: 'small', ...options, onClick: click }, () => text)
       const setField = (key, value) => {
         if (busy.value || saved.value) return
+        const serverChanged = key === 'fusion_server_ref' && value !== draft.value[key]
+        const accountChanged = key === 'fusion_user_id' && vaEmbyAccountId(value) !== vaEmbyAccountId(draft.value[key])
+        if (serverChanged) {
+          resetDirectory()
+          draft.value.fusion_user_id = ''
+        }
+        if (serverChanged || accountChanged) {
+          draft.value.fusion_library_mode = 'unselected'
+          draft.value.fusion_library_ids = ''
+        }
         draft.value[key] = value
         serverIssue.value = null
         message.value = ''
+      }
+      function resetDirectory() {
+        directoryRequest++
+        accounts.value = null; accountError.value = ''; loadingAccounts.value = false; manualAccount.value = false
+      }
+      async function readAccounts() {
+        const server = draft.value.fusion_server_ref
+        if (!server || !validId || busy.value || saved.value || loadingAccounts.value) return
+        const request = ++directoryRequest
+        loadingAccounts.value = true; accountError.value = ''; manualAccount.value = false
+        try {
+          const result = await props.api.get(path + '/fusion/binding/users', {params:{server_ref:server}})
+          if (!alive || request !== directoryRequest || saved.value) return
+          if (result?.success !== true || !Array.isArray(result.users)) throw Error()
+          accounts.value = result.users.filter(user => vaEmbyAccountId(user?.id) && typeof user.name === 'string' && user.name.trim())
+            .map(user => ({title:user.name,value:vaEmbyAccountId(user.id)}))
+          if (!accounts.value.length) accountError.value = '此服务器未返回可选账号。'
+        } catch {
+          if (alive && request === directoryRequest) accountError.value = '无法读取账号，请重试或手动填写 ID。'
+        } finally {
+          if (alive && request === directoryRequest) loadingAccounts.value = false
+        }
+      }
+      function accountField() {
+        const id = vaEmbyAccountId(draft.value.fusion_user_id)
+        const server = draft.value.fusion_server_ref
+        const manual = manualAccount.value
+        const items = accounts.value || []
+        const props = fieldProps('fusion_user_id')
+        const input = manual ? h(resolveComponent('VTextField'), {...props, label:'Emby 用户 ID', autocomplete:'off',
+          modelValue:draft.value.fusion_user_id, 'onUpdate:modelValue':v=>setField('fusion_user_id',v)}) :
+          items.length ? h(resolveComponent('VSelect'), {...props, label:'Emby 账号', items,
+            modelValue:items.some(item=>item.value===id) ? id : null,
+            'onUpdate:modelValue':v=>{if(draft.value.fusion_server_ref===server && accounts.value===items &&
+              items.some(item=>item.value===v)) setField('fusion_user_id',v)}}) :
+          textButton(loadingAccounts.value?'正在读取账号':accountError.value?'重新读取账号':
+            id?'更换 Emby 账号':'选择 Emby 账号', readAccounts, {variant:'tonal',color:'primary',
+              disabled:busy.value || !server || loadingAccounts.value, loading:loadingAccounts.value})
+        return h('div', {'data-model-key':'fusion_user_id'}, [
+          input,
+          !manual && id && !items.some(item=>item.value===id) ?
+            h('span',{class:'text-caption ms-2'},'当前账号 · …'+id.slice(-6)) : null,
+          accountError.value && !manual ? h('div',{role:'status',class:'text-caption mt-1'},accountError.value) : null,
+          textButton(manual?'按账号名称选择':'手动填写 ID', () => {
+            if (manual) { manualAccount.value = false; if (!accounts.value?.length) readAccounts() }
+            else { resetDirectory(); manualAccount.value = true }
+          }, {disabled:busy.value || !server, size:'x-small'}),
+        ])
       }
       function focusField(key) {
         const field = container.value?.querySelector('[data-model-key="' + key + '"]')
@@ -651,6 +979,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
           if (response?.render_mode !== 'vue' || !Array.isArray(response.conf) || !response.conf.length || !response.model ||
               typeof response.model !== 'object' || Array.isArray(response.model)) throw Error()
           if (!alive) return
+          resetDirectory()
           form.value = response.conf
           draft.value = copy(response.model)
           original = JSON.stringify(draft.value)
@@ -661,6 +990,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
             if (Number(draft.value.fusion_execution_daily_limit) > 3) draft.value.fusion_execution_daily_limit = 3
             nextTick(() => focusField('fusion_execution_preset'))
           }
+          if (nextBinding.value) nextTick(() => focusField(nextBinding.value?.key))
           conflict.value = false
           serverIssue.value = null
         } catch { if (alive) message.value = '无法读取插件设置。' }
@@ -690,9 +1020,25 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         catch { if (alive) message.value = '设置已保存，暂时无法读取授权范围。' }
         finally { if (alive) busy.value = false }
       }
+      async function persistDraft(snapshot) {
+        if (JSON.stringify(snapshot) === original) return true
+        const latest = await props.api.get('plugin/form/' + pluginId)
+        if (!alive) return false
+        if (!latest?.model || JSON.stringify(latest.model) !== original) {
+          conflict.value = true
+          message.value = '设置已在其他窗口更改。请重新读取后再编辑。'
+          return false
+        }
+        const result = await props.api.put(path, snapshot)
+        if (result?.success !== true) throw Error()
+        if (!alive) return false
+        original = JSON.stringify(snapshot)
+        return true
+      }
       async function save() {
-        if (!alive || !loaded.value || busy.value || saved.value || conflict.value || issues.value.length) return
-        if (draft.value.fusion_execution_enabled !== true) {
+        if (!alive || !loaded.value || busy.value || saved.value || conflict.value || issues.value.length ||
+            (personalSetup.value && nextBinding.value)) return
+        if (!personalSetup.value && draft.value.fusion_execution_enabled !== true) {
           vaClearHandoff()
           emit('save', copy(draft.value))
           return
@@ -702,6 +1048,19 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         message.value = ''
         serverIssue.value = null
         try {
+          if (personalSetup.value) {
+            if (!await persistDraft(snapshot)) return
+            message.value = '设置已保存，正在验证 Emby 账号…'
+            try {
+              const result = await props.api.post(path + '/fusion/validate', {})
+              if (result?.success !== true) throw Error()
+            } catch {
+              if (alive) message.value = '设置已保存，账号暂未验证。请核对账号和媒体库后重试。'
+              return
+            }
+            if (alive) { vaReturnToBoard(boardBookmark); emit('switch') }
+            return
+          }
           // Send just the required draft fields, never private host config or API credentials.
           const allowed = ['fusion_enabled', 'fusion_server_ref', 'fusion_user_id', 'fusion_library_mode',
             'fusion_library_ids', 'fusion_discovery_enabled', 'fusion_discovery_sources']
@@ -716,19 +1075,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
             message.value = entry ? '' : '执行条件未通过检查。请核对自动订阅设置后重试。'
             return
           }
-          if (JSON.stringify(snapshot) !== original) {
-            const latest = await props.api.get('plugin/form/' + pluginId)
-            if (!alive) return
-            if (!latest?.model || JSON.stringify(latest.model) !== original) {
-              conflict.value = true
-              message.value = '设置已在其他窗口更改。请重新读取后再编辑。'
-              return
-            }
-            const result = await props.api.put(path, snapshot)
-            if (result?.success !== true) throw Error()
-            if (!alive) return
-            original = JSON.stringify(snapshot)
-          }
+          if (!await persistDraft(snapshot)) return
           saved.value = true
           await fetchReview()
         } catch {
@@ -776,8 +1123,9 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         saved.value = false; review.value = null; message.value = ''; deliberate.value = false; clearTimeout(guardTimer)
       }
       function footerActions() {
-        if (!saved.value) return [textButton('保存', save,{key:'draft-save',color:'primary',variant:'flat',
-          loading:busy.value,disabled:!loaded.value || busy.value || conflict.value || issues.value.length>0})]
+        if (!saved.value) return [textButton(personalSetup.value ? '保存并验证' : '保存', save,{key:'draft-save',color:'primary',variant:'flat',
+          loading:busy.value,disabled:!loaded.value || busy.value || conflict.value || issues.value.length>0 ||
+            (personalSetup.value && !!nextBinding.value)})]
         const intent = presented.value.selected
         const actions = [textButton(intent?.grant?'暂不授权':'完成',close,{key:'review-done',disabled:busy.value})]
         if (intent) actions.push(textButton(intent.grant?'确认范围并授权':'撤销自动订阅授权',e=>act(intent,e),{
@@ -788,18 +1136,22 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         return actions
       }
       return () => h('section', { ref: container, class: 'va-shell va-config' }, [
-        vaHeader(Vue,'观影助手设置',close,busy.value),
+        vaHeader(Vue,personalSetup.value ? '绑定我的 Emby' : '观影助手设置',close,busy.value),
         h('div', { class: 'pa-4 va-scroll' }, [
           !loaded.value && !message.value ? h('p', { role: 'status' }, '正在读取设置…') : null,
           !loaded.value && message.value ? textButton('重试', load, { disabled: busy.value }) : null,
           conflict.value ? textButton('重新读取设置', load, { disabled: busy.value }) : null,
-          ...(loaded.value && !saved.value ? form.value.map(node => renderNode(Vue, node,
-            { model: draft.value, setField, fieldProps, pluginId })) : []),
+          ...(loaded.value && !saved.value ? form.value.filter(node => !personalSetup.value || node.props?.['data-va-binding']).map(node => renderNode(Vue, node,
+            { model: draft.value, setField, fieldProps, pluginId, renderAccountField:accountField,
+              libraryPicker:LibraryPicker, api:props.api })) : []),
           saved.value && review.value ? h('section',{ref:scopeRegion,tabindex:-1,'aria-label':'已保存的自动订阅范围'},
             presented.value.scope.map(node=>renderNode(Vue,node,{pluginId}))) : null,
           saved.value && !review.value && !busy.value ? textButton('刷新授权状态', readSaved) : null,
         ]),
         message.value ? h('p', { role:'status',class:'text-body-2 px-4 py-2 border-t',style:'flex:none' }, message.value) : null,
+        loaded.value && !saved.value && nextBinding.value && draft.value.fusion_execution_enabled !== true ?
+          h('div',{class:'px-4 py-1 border-t'},[textButton('个人选片 · '+nextBinding.value.text,
+            ()=>focusField(nextBinding.value.key),{disabled:busy.value,color:'primary'})]) : null,
         loaded.value && !saved.value && issues.value.length ? h('div', {
           class: 'px-4 py-2 border-t', style: 'flex:0 0 auto;max-height:24dvh;overflow:auto', 'aria-live': 'polite',
         }, [

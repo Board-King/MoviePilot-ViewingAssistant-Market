@@ -15,6 +15,7 @@ import time
 
 from .emby import EmbyReadOnlyClient, EmbyReadError
 from .profile import SnapshotAccumulator, ProfileError
+from .tonight import select_tonight
 from .ui import FORM_DEFAULTS as DEFAULTS
 
 
@@ -125,10 +126,13 @@ class SnapshotService:
             result["cooldown_remaining"] = max(0, int(result.get("retry_until", 0) - self._clock() + 0.999))
             if self._config["enabled"] and self._cancel.is_set():
                 result.update(status="paused", message="采集服务已停止，当前没有后台快照运行")
-            result["stale"] = bool(result.get("profile") and (
-                result.get("last_attempt_failed") or not result.get("last_success")
-                or self._clock() - result["last_success"] > self._config["hours"] * 3600 * 2))
+            result["stale"] = self._profile_stale()
             return result
+
+    def _profile_stale(self):
+        return bool(self._state.get("profile") and (
+            self._state.get("last_attempt_failed") or not self._state.get("last_success")
+            or self._clock() - self._state["last_success"] > self._config["hours"] * 3600 * 2))
 
     def evaluation_context(self):
         """Internal immutable input for ranking; never returns credentials/history."""
@@ -138,6 +142,59 @@ class SnapshotService:
             return {"binding": self._state.get("binding"), "enabled": self._config["enabled"],
                     "baseline": baseline, "stale": current["stale"],
                     "as_of": ((baseline or {}).get("method") or {}).get("as_of")}
+
+    def binding_users(self, server_ref: str):
+        """Return choices only for a server already configured in MoviePilot."""
+        if not isinstance(server_ref, str) or not server_ref or len(server_ref) > 200:
+            return {"success": False, "users": []}
+        try:
+            with self._client_factory(self._resolve(server_ref), deadline_seconds=8) as client:
+                users = [{"id": u["id"], "name": u["name"]} for u in client.list_users()
+                         if u["disabled"] is False and u["name"]]
+            return {"success": True, "users": users}
+        except Exception:
+            return {"success": False, "users": []}
+
+    def binding_libraries(self, server_ref: str, user_id: str):
+        """List library names for an explicit choice; selecting the allowed scope is separate."""
+        if (not isinstance(server_ref, str) or not 0 < len(server_ref) <= 200
+                or not isinstance(user_id, str) or not re.fullmatch(r"[a-f0-9]{32}", user_id)):
+            return {"success": False, "libraries": []}
+        try:
+            with self._client_factory(self._resolve(server_ref), deadline_seconds=8) as client:
+                client.verify_binding(client.describe_server()["id"], user_id)
+                views = [{"id": view["id"], "name": view["name"]} for view in client.list_views(user_id)
+                         if view["name"] and len(view["id"]) <= 80 and (view["collection_type"] or "").lower()
+                         in ("", "movies", "tvshows", "mixed", "homevideos", "boxsets")]
+            return {"success": True, "libraries": views}
+        except Exception:
+            return {"success": False, "libraries": []}
+
+    def tonight(self, max_minutes: int = 0, chinese_subtitles: bool = False):
+        """User-initiated library read. Never change a binding, snapshot or grant here."""
+        if not self._run_lock.acquire(blocking=False):
+            return {"success": False, "reason": "BUSY"}
+        try:
+            with self._lock:
+                if not self._config["enabled"] or not configuration_ready(self._config):
+                    return {"success": False, "reason": "SETUP_REQUIRED"}
+                if not self._state.get("native_server_id"):
+                    return {"success": False, "reason": "VERIFY_REQUIRED"}
+                capture = self._capture()
+                if not capture:
+                    return {"success": False, "reason": "UNAVAILABLE"}
+                epoch, cancel, config, state = capture
+                baseline = None if self._profile_stale() else (state.get("profile") or {}).get("baseline")
+            result = select_tonight(self._resolve(config["server_ref"]), server_id=state["native_server_id"],
+                                    user_id=config["user_id"], scope=config["scope"], baseline=baseline,
+                                    max_minutes=max_minutes, chinese_subtitles=chinese_subtitles,
+                                    stop_callback=cancel.is_set)
+            with self._lock:
+                return result if self._current(epoch, cancel) else {"success": False, "reason": "UNAVAILABLE"}
+        except Exception:
+            return {"success": False, "reason": "UNAVAILABLE"}
+        finally:
+            self._run_lock.release()
 
     def _capture(self, *, binding_only=False):
         with self._lock:

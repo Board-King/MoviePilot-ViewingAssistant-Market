@@ -18,6 +18,12 @@ function renderNode(Vue, node, ctx = {}) {
     const flag = /^\{\{\s*(\w+)\s*\}\}$/.exec(condition)
     if (!(eq ? ctx.model?.[eq[1]] === eq[2] : flag && ctx.model?.[flag[1]] === true)) return null
   }
+  if (key === 'fusion_user_id' && ctx.renderAccountField) return ctx.renderAccountField()
+  if (key === 'fusion_library_ids' && ctx.libraryPicker) {
+    const {fusion_server_ref:server, fusion_user_id:user} = ctx.model
+    return Vue.h(ctx.libraryPicker,{key:JSON.stringify([server,user]),server,user,value:ctx.model[key],
+      api:ctx.api,pluginId:ctx.pluginId,fieldProps:ctx.fieldProps(key),onChange:value=>ctx.setField(key,value)})
+  }
   if (key && ctx.setField) {
     Object.assign(props, ctx.fieldProps?.(key) || {}, {
       'data-model-key': key, modelValue: ctx.model[key],
@@ -36,6 +42,7 @@ function renderNode(Vue, node, ctx = {}) {
 
 // The page never starts a task on mount. Refresh/authorization need a user click.
 function makePage(Vue, pluginId) {
+  const Tonight = makeTonight(Vue)
   const Shelf = makeShelf(Vue)
   const SubtitleRail = makeSubtitleRail(Vue)
   const Support = makeSupport(Vue)
@@ -51,7 +58,7 @@ function makePage(Vue, pluginId) {
       function settings(target) {
         if (!props.show_switch || busy.value) return
         vaLeaveBoard({selection:{...selection},top:scroller.value?.scrollTop || 0,
-          target:target === 'ranked' ? 'ranked' : undefined})
+          target:['ranked','tonight'].includes(target) ? target : undefined})
         emit('switch')
       }
       function shelfReady(newSelection) {
@@ -114,6 +121,8 @@ function makePage(Vue, pluginId) {
           vaHeader(Vue,'观影助手',()=>emit('close'),false),
           h('div',{ref:scroller,class:'va-scroll pa-4'}, [
             !rows.value && !error.value ? h('div',{role:'status',class:'py-4'},'正在读取看板…') : null,
+            rows.value ? h(Tonight,{key:'tonight',api:props.api,pluginId,initial:rows.value,
+              onSettings:props.show_switch ? settings : undefined}) : null,
             ...(rows.value || []).map(row => row.props?.['data-va-shelf']
               ? h(Shelf,{key:'shelf', initial:row,api:props.api,pluginId,resume:resume?.selection,onReady:shelfReady})
               : renderNode(Vue,row,{pluginId, SubtitleRail, busy:busy.value,toolbarPrimary:true,onAction:action,

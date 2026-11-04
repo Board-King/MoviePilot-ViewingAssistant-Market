@@ -4,7 +4,7 @@ const { readFileSync } = require('node:fs')
 const path = require('node:path')
 const vm = require('node:vm')
 const { test } = require('node:test')
-const script = ['shell','config'].map(name=>readFileSync(path.join(__dirname, '../frontend/'+name+'.js'), 'utf8')).join('\n')
+const script = ['shell','library-picker','config'].map(name=>readFileSync(path.join(__dirname, '../frontend/'+name+'.js'), 'utf8')).join('\n')
 const { makeConfig, draftIssues, vaTakeHandoff, vaLeaveBoard } = vm.runInNewContext(
   script + '\n;({makeConfig,draftIssues,vaTakeHandoff,vaLeaveBoard})',{setTimeout,clearTimeout})
 const id = 'PtSubtitleFollowup', base = 'plugin/' + id, scope = base + '/fusion/execution/'
@@ -15,13 +15,14 @@ const full = {
   fusion_execution_preset: 'conservative', fusion_execution_daily_limit: 1,
   fusion_execution_legacy_isolated: true, fusion_execution_storage_verified: true, unrelated_option: 'preserve-me',
 }
-async function open(config, failAt) {
+async function open(config, failAt, directory) {
   const calls = [], emitted = []
   let persisted = structuredClone(config), mounted, updateField, armed = false
   const api = {
-    async get(url) {
+    async get(url, options) {
       calls.push(['GET', url])
-      if (url === 'plugin/form/' + id) return { conf: [{ kind: 'form' }], model: persisted, render_mode: 'vue' }
+      if (url === 'plugin/form/' + id) return { conf: [{ kind: 'form',props:{'data-va-binding':true} }], model: persisted, render_mode: 'vue' }
+      if (url === base + '/fusion/binding/users') return directory(options.params.server_ref)
       assert.equal(url, scope + 'review')
       if (failAt === 'review') throw Error()
       const grant = {method:'POST',api:scope+'authorize',params:{expected_digest:failAt==='digest'?'bad':'a'.repeat(64)}}
@@ -51,7 +52,10 @@ async function open(config, failAt) {
     onMounted: fn => { mounted = fn }, onUnmounted() {}, resolveComponent: name => name, nextTick: fn => fn(),
   }
   const view = makeConfig(Vue, (_vue, node, ctx) => {
-    if (node.kind === 'form') updateField = ctx.setField
+    if (node.kind === 'form') {
+      updateField = ctx.setField
+      return ctx.renderAccountField()
+    }
     return { type: node.kind }
   }, 'Support', id).setup({ api }, { emit: (...args) => emitted.push(args) })
   await mounted()
@@ -61,7 +65,8 @@ async function open(config, failAt) {
     return [node, ...(Array.isArray(node.children) ? node.children.flatMap(flatten) : [])]
   }
   function button(label) { return flatten(view()).find(node => node.type === 'VBtn' && node.children === label) }
-  return { calls, emitted, button, edit: (key, value) => { view(); updateField(key, value) },
+  return { calls, emitted, button, find: type=>flatten(view()).find(node=>node.type===type),
+    edit: (key, value) => { view(); updateField(key, value) },
     external: () => { persisted = { ...persisted, unrelated_option: 'changed' } } }
 }
 
@@ -78,6 +83,84 @@ test('all missing requirements appear together, invalid clicks cannot save and d
   assert.equal(ui.emitted[0][1].maxWidth,'80rem')
   assert.equal(ui.emitted[1][0], 'save')
   assert.equal(ui.emitted[1][1].unrelated_option, 'preserve-me')
+})
+
+test('an existing binding is reused without reading users, and opening or cancelling the picker preserves it', async () => {
+  const config = {...full,fusion_execution_enabled:false}
+  const ui = await open(config,null,async server=>{
+    assert.equal(server,'Test')
+    return {success:true,users:[{name:'Test viewer',id:'a'.repeat(32)}]}
+  })
+  assert.deepEqual(ui.calls,[['GET','plugin/form/'+id]])
+  assert.ok(ui.button('更换 Emby 账号'))
+  await ui.button('更换 Emby 账号').props.onClick()
+  assert.equal(ui.find('VSelect').props.modelValue,config.fusion_user_id)
+  await ui.button('保存').props.onClick()
+  assert.deepEqual(JSON.parse(JSON.stringify(ui.emitted.at(-1))), ['save',config])
+})
+
+test('changing server discards a pending directory, invalidates its selector and requires a new explicit scope', async () => {
+  const firstId='a'.repeat(32), secondId='b'.repeat(32)
+  let resolveFirst
+  const oldDirectory = new Promise(resolve=>{resolveFirst=resolve})
+  const ui = await open({...full,fusion_execution_enabled:false},null,
+    server=>server==='Test' ? oldDirectory : Promise.resolve({success:true,users:[{name:'Second viewer',id:secondId}]}))
+  const pending=ui.button('更换 Emby 账号').props.onClick()
+  ui.edit('fusion_server_ref','Other')
+  await ui.button('选择 Emby 账号').props.onClick()
+  resolveFirst({success:true,users:[{name:'Old viewer',id:firstId}]})
+  await pending
+  const select=ui.find('VSelect')
+  assert.equal(select.props.items.length,1)
+  assert.equal(select.props.items[0].value,secondId)
+  assert.equal(select.props.modelValue,null)
+  select.props['onUpdate:modelValue'](secondId)
+  assert.equal(ui.find('VSelect').props.modelValue,secondId)
+  await ui.button('保存').props.onClick()
+  const saved=ui.emitted.at(-1)[1]
+  assert.equal(saved.fusion_user_id,secondId)
+  assert.equal(saved.fusion_library_mode,'unselected')
+  assert.equal(saved.fusion_library_ids,'')
+  assert.equal(saved.unrelated_option,'preserve-me')
+})
+
+test('an inaccessible or empty directory leaves the ID intact and permits manual entry', async () => {
+  for (const response of [{success:false},{success:true,users:[]}]) {
+    const ui=await open({...full,fusion_execution_enabled:false},null,()=>Promise.resolve(response))
+    await ui.button('更换 Emby 账号').props.onClick()
+    assert.ok(ui.button('重新读取账号'))
+    ui.button('手动填写 ID').props.onClick()
+    const input=ui.find('VTextField')
+    assert.equal(input.props.modelValue,full.fusion_user_id)
+    input.props['onUpdate:modelValue']('d'.repeat(32))
+    await ui.button('保存').props.onClick()
+    const saved=ui.emitted.at(-1)[1]
+    assert.equal(saved.fusion_user_id,'d'.repeat(32))
+    assert.equal(saved.fusion_library_mode,'unselected')
+    assert.equal(saved.fusion_execution_enabled,false)
+  }
+})
+
+test('the tonight shortcut guides each missing binding step without enabling or granting automatically', async () => {
+  vaLeaveBoard({target:'tonight'})
+  const ui=await open({...full,fusion_enabled:false,fusion_server_ref:'',fusion_user_id:'',
+    fusion_library_mode:'unselected',fusion_execution_enabled:false})
+  assert.ok(ui.button('个人选片 · 打开观影偏好更新'))
+  assert.equal(ui.button('保存并验证').props.disabled,true)
+  ui.edit('fusion_enabled',true)
+  assert.ok(ui.button('个人选片 · 选择 Emby 服务器'))
+  ui.edit('fusion_server_ref','Test')
+  assert.ok(ui.button('个人选片 · 选择 Emby 账号'))
+  ui.edit('fusion_user_id','e'.repeat(32))
+  assert.ok(ui.button('个人选片 · 选择授权媒体库'))
+  ui.edit('fusion_library_mode','all_visible')
+  assert.equal(ui.button('保存并验证').props.disabled,false)
+  assert.deepEqual(ui.calls,[['GET','plugin/form/'+id]])
+  await ui.button('保存并验证').props.onClick()
+  assert.deepEqual(ui.calls.map(call=>call.slice(0,2)), [
+    ['GET','plugin/form/'+id], ['GET','plugin/form/'+id], ['PUT',base], ['POST',base+'/fusion/validate']
+  ])
+  assert.equal(ui.emitted.at(-1)[0],'switch')
 })
 
 test('the ranked shortcut prepares a visible draft and does not save or grant on open', async () => {

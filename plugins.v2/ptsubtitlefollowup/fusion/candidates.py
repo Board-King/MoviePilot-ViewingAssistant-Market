@@ -17,6 +17,8 @@ MAX_CANDIDATES = 500
 MAX_SOURCES = 16
 MAX_ITEMS = 5000
 ALGORITHM_VERSION = "taste-first-v2"
+DIMENSION_LABELS = {"genres": "题材", "languages": "语言", "decades": "年代",
+                    "actors": "演员", "directors": "导演", "keywords": "关键词"}
 
 
 class CandidateError(ValueError):
@@ -306,11 +308,9 @@ def rank_candidates(pool, baseline=None, *, as_of):
             missing.append("profile_support_missing")
             reasons.append("画像没有此候选相关特征的有效证据")
         else:
-            names = {"genres": "题材", "languages": "语言", "decades": "年代",
-                     "actors": "演员", "directors": "导演", "keywords": "关键词"}
             for detail in dimensions:
                 if detail["matched_labels"]:
-                    reasons.append(f"画像有相关{names[detail['dimension']]}证据：" + "、".join(detail["matched_labels"][:3]))
+                    reasons.append(f"画像有相关{DIMENSION_LABELS[detail['dimension']]}证据：" + "、".join(detail["matched_labels"][:3]))
         if candidate["metadata_conflict"]:
             missing.append("metadata_conflict")
             reasons.append("来源元数据不一致，采用一份完整快照，未混合演员或题材")

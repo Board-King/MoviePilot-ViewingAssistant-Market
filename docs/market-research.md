@@ -33,3 +33,5 @@
 本仓 0.6.5 正式 ZIP 在调研时 GitHub 计数为 **2 次下载**，其中可能含验收下载；独立安装数和活跃家庭数未知。当日第三方源 [Wiki 收录申请 #47](https://github.com/jxxghp/MoviePilot-Wiki/pull/47) 仍在审核。用户现在可以手动加源，收录后也要经过相应的同步流程。官方项目对在国内平台宣传 MoviePilot 有明确提示，试用以自有 GitHub 演示、允许的插件源、自愿报名和已有用户转介为主。[发行数据接口](https://api.github.com/repos/Board-King/MoviePilot-ViewingAssistant-Market/releases/tags/PtSubtitleFollowup_v0.6.5) · [市场说明](https://wiki.movie-pilot.org/plugin) · [上游 V2 项目说明](https://github.com/jxxghp/MoviePilot/blob/v2/README.md)
 
 第一批试用要同时听管理员与实际观众的意见，记录原来的选片办法、过去一周共同观影次数、装好后谁第一次使用、最终播放哪一步失败。公开报告只用匿名汇总和虚构截图。后续阶段、目标样本数与改变方向的条件见[进化路线](../ROADMAP.md)。
+
+**调研后的排期决定**　以上家庭共选需求来自定性材料。维护者选择先验证个人库内选片：10 位试用者中有多少人真正通过推荐开播，第二周是否自行再用。家庭共选留到个人复用成立后再招募验证。[个人阶段规格](movie-night.md)

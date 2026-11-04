@@ -107,7 +107,7 @@ class PtSubtitleFollowup(_PluginBase):
     plugin_name = "观影助手"
     plugin_desc = "按你的 Emby 口味，发现下一部想看的片。"
     plugin_icon = "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png"
-    plugin_version = "0.6.5"
+    plugin_version = "0.7.0"
     plugin_author = "Board-King"
     author_url = "https://github.com/Board-King"
     plugin_url = "https://github.com/Board-King/MoviePilot-ViewingAssistant-Market"
@@ -645,6 +645,12 @@ class PtSubtitleFollowup(_PluginBase):
 
         fusion_routes.append({"path": "/support", "endpoint": self._support, "methods": ["GET"], "auth": "bear",
                               "dependencies": [Depends(get_current_active_superuser), Depends(signed_in)]})
+        for path, endpoint, description in (("/fusion/tonight", self._fusion.tonight, "从已绑定用户的授权电影库选片"),
+                                            ("/fusion/binding/users", self._fusion.binding_users, "按需选择 Emby 用户"),
+                                            ("/fusion/binding/libraries", self._fusion.binding_libraries, "选择该账号可见的影视库")):
+            fusion_routes.append({"path": path, "endpoint": endpoint, "methods": ["GET"], "auth": "bear",
+                                  "summary": description,
+                                  "dependencies": [Depends(get_current_active_superuser), Depends(signed_in)]})
         if self._execution:
             for name, endpoint, method in (("status", self._execution.status, "GET"),
                                            ("preflight", self._execution_preflight, "POST"),

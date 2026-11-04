@@ -21,6 +21,7 @@ fusion/source_registry.py
 fusion/sources.py
 fusion/subscription_host.py
 fusion/subtitle_ui.py
+fusion/tonight.py
 fusion/ui.py
 fusion/upcoming.py
 providers.py

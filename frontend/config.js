@@ -1,23 +1,35 @@
 // MoviePilot owns loading and persistence; the plugin owns when its draft may be saved.
+function vaEmbyAccountId(value) {
+  if (typeof value !== 'string' || !/^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(value)) return ''
+  return value.replace(/-/g, '').toLowerCase()
+}
+
+function vaBindingIssues(draft) {
+  const issues = []
+  if (draft.fusion_enabled !== true) issues.push({key:'fusion_enabled', text:'打开观影偏好更新'})
+  const server = draft.fusion_server_ref
+  if (typeof server !== 'string' || !server || server.trim() !== server || Array.from(server).length > 200 ||
+      /[\p{C}\p{Z}]/u.test(server.replace(/ /g, '')))
+    issues.push({key:'fusion_server_ref', text:'选择 Emby 服务器'})
+  if (!vaEmbyAccountId(draft.fusion_user_id)) issues.push({key:'fusion_user_id', text:'选择 Emby 账号'})
+  if (!['selected_ids','all_visible'].includes(draft.fusion_library_mode))
+    issues.push({key:'fusion_library_mode', text:'选择授权媒体库'})
+  if (draft.fusion_library_mode === 'selected_ids') {
+    const raw = draft.fusion_library_ids
+    const ids = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.trim().split(/[\s,]+/) : []
+    if (!ids.length || ids.length > 100 || !ids.every(x => typeof x === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(x)))
+      issues.push({key:'fusion_library_ids',text:'填写有效的媒体库 ID'})
+  }
+  return issues
+}
+
 function draftIssues(draft) {
   if (draft.fusion_execution_enabled !== true) return []
-  const issues = []
+  const issues = vaBindingIssues(draft)
   const need = (ok, key, text) => { if (!ok) issues.push({ key, text }) }
   const source = 'tmdb_popular_movie'
   const plain = (value, limit) => typeof value === 'string' && value.trim() === value &&
     value.length > 0 && Array.from(value).length <= limit && !/[\p{C}\p{Z}]/u.test(value.replace(/ /g, ''))
-  need(draft.fusion_enabled === true, 'fusion_enabled', '打开观影偏好更新')
-  need(plain(draft.fusion_server_ref, 200), 'fusion_server_ref', '选择 Emby 服务器')
-  const id = typeof draft.fusion_user_id === 'string' ? draft.fusion_user_id.replace(/-/g, '') : ''
-  need(/^[a-f0-9]{32}$/i.test(id), 'fusion_user_id', '填写 32 位 Emby 用户 ID')
-  const range = draft.fusion_library_mode
-  need(['selected_ids', 'all_visible'].includes(range), 'fusion_library_mode', '选择授权媒体库')
-  if (range === 'selected_ids') {
-    const raw = draft.fusion_library_ids
-    const ids = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.trim().split(/[\s,]+/) : []
-    need(ids.length > 0 && ids.length <= 100 && ids.every(x => typeof x === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(x)),
-      'fusion_library_ids', '填写有效的媒体库 ID')
-  }
   need(draft.fusion_discovery_enabled === true, 'fusion_discovery_enabled', '打开候选更新')
   need(Array.isArray(draft.fusion_discovery_sources) && draft.fusion_discovery_sources.includes(source),
     'fusion_discovery_sources', '候选来源加入 TMDB 热门电影')
@@ -59,6 +71,7 @@ function vaReviewScope(nodes, path) {
 }
 
 function makeConfig(Vue, renderNode, Support, pluginId) {
+  const LibraryPicker = makeLibraryPicker(Vue)
   const { h, ref, computed, onMounted, onUnmounted, nextTick, resolveComponent } = Vue
   const copy = value => JSON.parse(JSON.stringify(value))
   const resultText = {
@@ -73,11 +86,15 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
     setup(props, { emit }) {
       const boardBookmark = vaTakeHandoff('config')
       let openRankedDraft = boardBookmark?.target === 'ranked'
+      const tonightSetup = boardBookmark?.target === 'tonight'
       const draft = ref({}), form = ref([]), loaded = ref(false), busy = ref(false)
       const message = ref(''), serverIssue = ref(null), review = ref(null), saved = ref(false), conflict = ref(false)
       const container = ref(null)
       const scopeRegion = ref(null), deliberate = ref(false)
-      let alive = true, original = '', guardTimer
+      const accounts = ref(null), accountError = ref(''), loadingAccounts = ref(false), manualAccount = ref(false)
+      const nextBinding = computed(() => tonightSetup ? vaBindingIssues(draft.value)[0] : null)
+      const personalSetup = computed(() => tonightSetup && draft.value.fusion_execution_enabled !== true)
+      let alive = true, original = '', guardTimer, directoryRequest = 0
       onUnmounted(() => { alive = false; clearTimeout(guardTimer) })
       const issues = computed(() => [...draftIssues(draft.value), ...(serverIssue.value ? [serverIssue.value] : [])])
       const path = 'plugin/' + pluginId
@@ -86,9 +103,67 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         { variant: 'text', size: 'small', ...options, onClick: click }, () => text)
       const setField = (key, value) => {
         if (busy.value || saved.value) return
+        const serverChanged = key === 'fusion_server_ref' && value !== draft.value[key]
+        const accountChanged = key === 'fusion_user_id' && vaEmbyAccountId(value) !== vaEmbyAccountId(draft.value[key])
+        if (serverChanged) {
+          resetDirectory()
+          draft.value.fusion_user_id = ''
+        }
+        if (serverChanged || accountChanged) {
+          draft.value.fusion_library_mode = 'unselected'
+          draft.value.fusion_library_ids = ''
+        }
         draft.value[key] = value
         serverIssue.value = null
         message.value = ''
+      }
+      function resetDirectory() {
+        directoryRequest++
+        accounts.value = null; accountError.value = ''; loadingAccounts.value = false; manualAccount.value = false
+      }
+      async function readAccounts() {
+        const server = draft.value.fusion_server_ref
+        if (!server || !validId || busy.value || saved.value || loadingAccounts.value) return
+        const request = ++directoryRequest
+        loadingAccounts.value = true; accountError.value = ''; manualAccount.value = false
+        try {
+          const result = await props.api.get(path + '/fusion/binding/users', {params:{server_ref:server}})
+          if (!alive || request !== directoryRequest || saved.value) return
+          if (result?.success !== true || !Array.isArray(result.users)) throw Error()
+          accounts.value = result.users.filter(user => vaEmbyAccountId(user?.id) && typeof user.name === 'string' && user.name.trim())
+            .map(user => ({title:user.name,value:vaEmbyAccountId(user.id)}))
+          if (!accounts.value.length) accountError.value = '此服务器未返回可选账号。'
+        } catch {
+          if (alive && request === directoryRequest) accountError.value = '无法读取账号，请重试或手动填写 ID。'
+        } finally {
+          if (alive && request === directoryRequest) loadingAccounts.value = false
+        }
+      }
+      function accountField() {
+        const id = vaEmbyAccountId(draft.value.fusion_user_id)
+        const server = draft.value.fusion_server_ref
+        const manual = manualAccount.value
+        const items = accounts.value || []
+        const props = fieldProps('fusion_user_id')
+        const input = manual ? h(resolveComponent('VTextField'), {...props, label:'Emby 用户 ID', autocomplete:'off',
+          modelValue:draft.value.fusion_user_id, 'onUpdate:modelValue':v=>setField('fusion_user_id',v)}) :
+          items.length ? h(resolveComponent('VSelect'), {...props, label:'Emby 账号', items,
+            modelValue:items.some(item=>item.value===id) ? id : null,
+            'onUpdate:modelValue':v=>{if(draft.value.fusion_server_ref===server && accounts.value===items &&
+              items.some(item=>item.value===v)) setField('fusion_user_id',v)}}) :
+          textButton(loadingAccounts.value?'正在读取账号':accountError.value?'重新读取账号':
+            id?'更换 Emby 账号':'选择 Emby 账号', readAccounts, {variant:'tonal',color:'primary',
+              disabled:busy.value || !server || loadingAccounts.value, loading:loadingAccounts.value})
+        return h('div', {'data-model-key':'fusion_user_id'}, [
+          input,
+          !manual && id && !items.some(item=>item.value===id) ?
+            h('span',{class:'text-caption ms-2'},'当前账号 · …'+id.slice(-6)) : null,
+          accountError.value && !manual ? h('div',{role:'status',class:'text-caption mt-1'},accountError.value) : null,
+          textButton(manual?'按账号名称选择':'手动填写 ID', () => {
+            if (manual) { manualAccount.value = false; if (!accounts.value?.length) readAccounts() }
+            else { resetDirectory(); manualAccount.value = true }
+          }, {disabled:busy.value || !server, size:'x-small'}),
+        ])
       }
       function focusField(key) {
         const field = container.value?.querySelector('[data-model-key="' + key + '"]')
@@ -112,6 +187,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
           if (response?.render_mode !== 'vue' || !Array.isArray(response.conf) || !response.conf.length || !response.model ||
               typeof response.model !== 'object' || Array.isArray(response.model)) throw Error()
           if (!alive) return
+          resetDirectory()
           form.value = response.conf
           draft.value = copy(response.model)
           original = JSON.stringify(draft.value)
@@ -122,6 +198,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
             if (Number(draft.value.fusion_execution_daily_limit) > 3) draft.value.fusion_execution_daily_limit = 3
             nextTick(() => focusField('fusion_execution_preset'))
           }
+          if (nextBinding.value) nextTick(() => focusField(nextBinding.value?.key))
           conflict.value = false
           serverIssue.value = null
         } catch { if (alive) message.value = '无法读取插件设置。' }
@@ -151,9 +228,25 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         catch { if (alive) message.value = '设置已保存，暂时无法读取授权范围。' }
         finally { if (alive) busy.value = false }
       }
+      async function persistDraft(snapshot) {
+        if (JSON.stringify(snapshot) === original) return true
+        const latest = await props.api.get('plugin/form/' + pluginId)
+        if (!alive) return false
+        if (!latest?.model || JSON.stringify(latest.model) !== original) {
+          conflict.value = true
+          message.value = '设置已在其他窗口更改。请重新读取后再编辑。'
+          return false
+        }
+        const result = await props.api.put(path, snapshot)
+        if (result?.success !== true) throw Error()
+        if (!alive) return false
+        original = JSON.stringify(snapshot)
+        return true
+      }
       async function save() {
-        if (!alive || !loaded.value || busy.value || saved.value || conflict.value || issues.value.length) return
-        if (draft.value.fusion_execution_enabled !== true) {
+        if (!alive || !loaded.value || busy.value || saved.value || conflict.value || issues.value.length ||
+            (personalSetup.value && nextBinding.value)) return
+        if (!personalSetup.value && draft.value.fusion_execution_enabled !== true) {
           vaClearHandoff()
           emit('save', copy(draft.value))
           return
@@ -163,6 +256,19 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         message.value = ''
         serverIssue.value = null
         try {
+          if (personalSetup.value) {
+            if (!await persistDraft(snapshot)) return
+            message.value = '设置已保存，正在验证 Emby 账号…'
+            try {
+              const result = await props.api.post(path + '/fusion/validate', {})
+              if (result?.success !== true) throw Error()
+            } catch {
+              if (alive) message.value = '设置已保存，账号暂未验证。请核对账号和媒体库后重试。'
+              return
+            }
+            if (alive) { vaReturnToBoard(boardBookmark); emit('switch') }
+            return
+          }
           // Send just the required draft fields, never private host config or API credentials.
           const allowed = ['fusion_enabled', 'fusion_server_ref', 'fusion_user_id', 'fusion_library_mode',
             'fusion_library_ids', 'fusion_discovery_enabled', 'fusion_discovery_sources']
@@ -177,19 +283,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
             message.value = entry ? '' : '执行条件未通过检查。请核对自动订阅设置后重试。'
             return
           }
-          if (JSON.stringify(snapshot) !== original) {
-            const latest = await props.api.get('plugin/form/' + pluginId)
-            if (!alive) return
-            if (!latest?.model || JSON.stringify(latest.model) !== original) {
-              conflict.value = true
-              message.value = '设置已在其他窗口更改。请重新读取后再编辑。'
-              return
-            }
-            const result = await props.api.put(path, snapshot)
-            if (result?.success !== true) throw Error()
-            if (!alive) return
-            original = JSON.stringify(snapshot)
-          }
+          if (!await persistDraft(snapshot)) return
           saved.value = true
           await fetchReview()
         } catch {
@@ -237,8 +331,9 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         saved.value = false; review.value = null; message.value = ''; deliberate.value = false; clearTimeout(guardTimer)
       }
       function footerActions() {
-        if (!saved.value) return [textButton('保存', save,{key:'draft-save',color:'primary',variant:'flat',
-          loading:busy.value,disabled:!loaded.value || busy.value || conflict.value || issues.value.length>0})]
+        if (!saved.value) return [textButton(personalSetup.value ? '保存并验证' : '保存', save,{key:'draft-save',color:'primary',variant:'flat',
+          loading:busy.value,disabled:!loaded.value || busy.value || conflict.value || issues.value.length>0 ||
+            (personalSetup.value && !!nextBinding.value)})]
         const intent = presented.value.selected
         const actions = [textButton(intent?.grant?'暂不授权':'完成',close,{key:'review-done',disabled:busy.value})]
         if (intent) actions.push(textButton(intent.grant?'确认范围并授权':'撤销自动订阅授权',e=>act(intent,e),{
@@ -249,18 +344,22 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         return actions
       }
       return () => h('section', { ref: container, class: 'va-shell va-config' }, [
-        vaHeader(Vue,'观影助手设置',close,busy.value),
+        vaHeader(Vue,personalSetup.value ? '绑定我的 Emby' : '观影助手设置',close,busy.value),
         h('div', { class: 'pa-4 va-scroll' }, [
           !loaded.value && !message.value ? h('p', { role: 'status' }, '正在读取设置…') : null,
           !loaded.value && message.value ? textButton('重试', load, { disabled: busy.value }) : null,
           conflict.value ? textButton('重新读取设置', load, { disabled: busy.value }) : null,
-          ...(loaded.value && !saved.value ? form.value.map(node => renderNode(Vue, node,
-            { model: draft.value, setField, fieldProps, pluginId })) : []),
+          ...(loaded.value && !saved.value ? form.value.filter(node => !personalSetup.value || node.props?.['data-va-binding']).map(node => renderNode(Vue, node,
+            { model: draft.value, setField, fieldProps, pluginId, renderAccountField:accountField,
+              libraryPicker:LibraryPicker, api:props.api })) : []),
           saved.value && review.value ? h('section',{ref:scopeRegion,tabindex:-1,'aria-label':'已保存的自动订阅范围'},
             presented.value.scope.map(node=>renderNode(Vue,node,{pluginId}))) : null,
           saved.value && !review.value && !busy.value ? textButton('刷新授权状态', readSaved) : null,
         ]),
         message.value ? h('p', { role:'status',class:'text-body-2 px-4 py-2 border-t',style:'flex:none' }, message.value) : null,
+        loaded.value && !saved.value && nextBinding.value && draft.value.fusion_execution_enabled !== true ?
+          h('div',{class:'px-4 py-1 border-t'},[textButton('个人选片 · '+nextBinding.value.text,
+            ()=>focusField(nextBinding.value.key),{disabled:busy.value,color:'primary'})]) : null,
         loaded.value && !saved.value && issues.value.length ? h('div', {
           class: 'px-4 py-2 border-t', style: 'flex:0 0 auto;max-height:24dvh;overflow:auto', 'aria-live': 'polite',
         }, [
