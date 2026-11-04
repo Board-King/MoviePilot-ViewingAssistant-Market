@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 import re
 import time
+import unicodedata
 
 
 VERSION = "v2.15.6"
@@ -65,7 +66,7 @@ def _permit(callback):
         raise _NotSent()
 
 
-def _existing(rows, identity, owner):
+def _existing(rows, identity, owner, *, external_ids=None):
     """Classify both canonical and legacy identities across all owners."""
     if len(rows) > MAX_SUBSCRIPTIONS:
         return {"status": "unknown", "sid": None}
@@ -82,6 +83,20 @@ def _existing(rows, identity, owner):
         if isinstance(legacy_key, str) and legacy_key.startswith(("tmdb:", "themoviedb:")):
             tmdb_ids.add(_tmdb(legacy_key.split(":", 1)[1]))
         if identity["media_id"] not in tmdb_ids:
+            # Compare in Douban's own namespace only when the movie and its
+            # exact IMDb cross-reference are both known; never search by name.
+            if not tmdb_ids and provider == "douban" and row["type"] == "电影" and external_ids:
+                douban_id = _tmdb(media_id)
+                aliases = [row.get("doubanid")]
+                if legacy_key:
+                    aliases.append(legacy_key.removeprefix("douban:") if isinstance(legacy_key, str)
+                                   and legacy_key.startswith("douban:") else False)
+                if douban_id and all(value in (None, "") or _tmdb(value) == douban_id for value in aliases):
+                    candidate_douban = external_ids(identity["media_id"]).get("douban")
+                    if candidate_douban == douban_id:
+                        return {"status": "conflict", "sid": None}
+                    if _tmdb(candidate_douban):
+                        continue
             # An unmapped movie may already represent the request on a different
             # provider. An explicit TV row with no matching key cannot own it.
             if row["type"] != "电视剧" and (not tmdb_ids or None in tmdb_ids or len(tmdb_ids) != 1):
@@ -100,6 +115,16 @@ def _existing(rows, identity, owner):
     if matches:
         return {"status": "existing", "sid": matches[0]}
     return {"status": "unknown" if incomplete else "absent", "sid": None}
+
+
+def _douban_movie_id(result):
+    if not isinstance(result, dict):
+        return None
+    value = result.get("id")
+    if _tmdb(value):
+        return _tmdb(value)
+    match = re.fullmatch(r"https://api\.douban\.com/movie/([1-9][0-9]{0,17})/?", value) if isinstance(value, str) else None
+    return match.group(1) if match else None
 
 
 class _ExactRecognition:
@@ -196,9 +221,24 @@ class _MoviePilot:
         sub = self.history if history else self.subscribe
         with self.engine.connect() as connection:
             statement = self.select(sub.id, sub.username, sub.type, sub.media_source, sub.media_id,
-                                    sub.mediaid, sub.tmdbid, sub.season, sub.episode_group,
+                                    sub.mediaid, sub.tmdbid, sub.doubanid, sub.season, sub.episode_group,
                                     sub.best_version).limit(MAX_SUBSCRIPTIONS + 1)
             return connection.execute(statement).mappings().all()
+
+    def external_ids(self, media_id):
+        from app.core.config import settings
+        from app.modules.douban.apiv2 import DoubanApi
+        from .sources import TmdbSourceClient
+        config = {"api_key": settings.TMDB_API_KEY, "proxies": settings.PROXY if settings.PROXY_HOST else None}
+        with TmdbSourceClient(config, deadline_seconds=10) as client:
+            detail = client.display_detail("movie", media_id)
+        imdb = detail.get("imdb_id")
+        if _tmdb(detail.get("id")) != media_id or not isinstance(imdb, str) or not re.fullmatch(r"tt[0-9]{7,12}", imdb):
+            return {}
+        # This native endpoint accepts only an IMDb ID. Higher-level MP search
+        # APIs silently fall back to a fuzzy title match when no ID is found.
+        douban = _douban_movie_id(DoubanApi().imdbid(imdb))
+        return {"imdb": imdb, "douban": douban}
 
     def add(self, identity, owner, may_dispatch):
         receiver = _ExactRecognition(self.chain_type(), identity, self.movie_type, may_dispatch)
@@ -229,7 +269,57 @@ def _query_result(response):
     return items
 
 
-def _emby_movie(config, media_id, deadline):
+def _title_key(value):
+    if not isinstance(value, str) or len(value) > 512:
+        return ""
+    return "".join(c for c in unicodedata.normalize("NFKC", value).casefold() if c.isalnum())
+
+
+def _unidentified_movies(get, query, first):
+    """Only cache complete bounded reads, without paths, user data or playback history."""
+    records = []
+    count = first.get("TotalRecordCount")
+    if type(count) is not int or not 0 <= count <= 512:
+        raise ValueError("Unidentified movie inventory exceeded bounds")
+    seen = set()
+    page = first
+    while True:
+        rows = page.get("Items")
+        if (page.get("TotalRecordCount") != count or not isinstance(rows, list)
+                or len(rows) != min(128, count - len(records))):
+            raise ValueError("Incomplete unidentified movie inventory")
+        for row in rows:
+            if not isinstance(row, dict) or row.get("Type") != "Movie" or not isinstance(row.get("ProviderIds"), dict):
+                raise ValueError("Invalid movie record")
+            key = row.get("Id")
+            if (not isinstance(key, str) or not key or key in seen
+                    or any(str(k).casefold() == "tmdb" for k in row["ProviderIds"])):
+                raise ValueError("Unstable or unfiltered movie inventory")
+            seen.add(key)
+            names = frozenset(filter(None, (_title_key(row.get("Name")), _title_key(row.get("OriginalTitle")))))
+            year = row.get("ProductionYear")
+            records.append((names, year if type(year) is int and 1800 <= year <= 2200 else None))
+        if len(records) == count:
+            return records
+        page = get("/Items", {**query, "StartIndex": len(records)})
+
+
+def _unidentified_match(records, identity):
+    if not records:
+        return "absent"
+    name, year = _title_key(identity["title"]), identity.get("year")
+    for names, record_year in records:
+        year_overlaps = year is None or record_year is None or abs(year - record_year) <= 1
+        if not year_overlaps:
+            continue
+        if not name or not names or name in names:
+            return "unknown"
+        if any(min(len(name), len(label)) >= 4 and (name in label or label in name) for label in names):
+            return "unknown"
+    return "no_known_match"
+
+
+def _emby_movie(config, identity, deadline, indexed_only, gap_cache):
     import requests
     from .emby import _base_url
     base, token = _base_url(config.get("host")), config.get("apikey")
@@ -264,6 +354,7 @@ def _emby_movie(config, media_id, deadline):
             return "unknown"
         query = {"Recursive": "true", "IncludeItemTypes": "Movie", "Fields": "ProviderIds",
                  "EnableUserData": "false", "EnableImages": "false", "Limit": 1, "StartIndex": 0}
+        media_id = identity["media_id"]
         hits = _query_result(get("/Items", {**query, "AnyProviderIdEquals": "tmdb." + media_id}))
         if hits:
             item = hits[0]
@@ -274,13 +365,33 @@ def _emby_movie(config, media_id, deadline):
                 return "unknown"
             return "present"
         # A negative ID query alone misses movies with incomplete metadata.
-        gaps = _query_result(get("/Items", {**query, "HasTmdbId": "false"}))
-        return "unknown" if gaps else "absent"
+        gap_query = {**query, "HasTmdbId": "false"}
+        if not indexed_only:
+            return "unknown" if _query_result(get("/Items", gap_query)) else "absent"
+        # A rank-based grant may use identified movies, while similar unindexed
+        # records still block dispatch. This result is distinct from full absence.
+        cache_key = hashlib.sha256((base + "\0" + token).encode()).digest()
+        expiry, records = gap_cache.get(cache_key, (0, ()))
+        if expiry <= time.monotonic():
+            gap_query.update(Fields="ProviderIds,OriginalTitle,ProductionYear", Limit=128, SortBy="SortName")
+            records = _unidentified_movies(get, gap_query, get("/Items", gap_query))
+            if len(gap_cache) >= MAX_SERVERS:
+                gap_cache.clear()
+            gap_cache[cache_key] = (time.monotonic() + 15, records)
+        return _unidentified_match(records, identity)
 
 
 class HostSubscriptionAdapter:
     def __init__(self, server_supplier, *, native_factory=_verified_host, library_probe=_emby_movie):
         self._servers, self._native, self._probe = server_supplier, native_factory, library_probe
+        self._gap_cache = {}
+        self._external_ids = lru_cache(maxsize=8)(self._read_external_ids)
+
+    def _read_external_ids(self, media_id):
+        try:
+            return self._native().external_ids(media_id)
+        except Exception:
+            return {}
 
     def compatibility(self, owner):
         result = {"ready": False, "version": "", "owner_key": "", "host_key": ""}
@@ -294,14 +405,15 @@ class HostSubscriptionAdapter:
                 pass
         return result
 
-    def lookup_subscription(self, identity, owner):
+    def lookup_subscription(self, identity, owner, *, indexed_only=False):
         if _movie(identity) and self.compatibility(owner)["ready"]:
             try:
                 host = self._native()
-                current = _existing(host.subscriptions(), identity, owner)
+                external = self._external_ids if indexed_only else None
+                current = _existing(host.subscriptions(), identity, owner, external_ids=external)
                 if current["status"] != "absent":
                     return current
-                history = _existing(host.subscriptions(history=True), identity, owner)
+                history = _existing(host.subscriptions(history=True), identity, owner, external_ids=external)
                 if history["status"] in {"existing", "conflict"}:
                     return {"status": "conflict", "sid": None}
                 return history
@@ -309,34 +421,38 @@ class HostSubscriptionAdapter:
                 pass
         return {"status": "unknown", "sid": None}
 
-    def lookup_library(self, identity):
+    def lookup_library(self, identity, *, indexed_only=False, fresh=False):
         if not _movie(identity):
             return "unknown"
         try:
             servers = self._servers()
             if not isinstance(servers, list) or not 1 <= len(servers) <= MAX_SERVERS:
                 return "unknown"
-            complete = True
+            statuses = []
             deadline = time.monotonic() + 20
             for server in servers:
                 if (not isinstance(server, dict) or server.get("enabled") is not True
                         or str(server.get("type", "")).casefold() != "emby"
                         or not isinstance(server.get("config"), dict) or time.monotonic() >= deadline):
-                    complete = False
+                    statuses.append("unknown")
                     continue
                 try:
-                    status = self._probe(server["config"], identity["media_id"], deadline)
+                    status = self._probe(server["config"], identity, deadline, indexed_only is True,
+                                         {} if fresh else self._gap_cache)
                 except Exception:
                     status = "unknown"
                 if status == "present":
                     return "present"
-                if status != "absent":
-                    complete = False
-            return "absent" if complete else "unknown"
+                statuses.append(status)
+            if all(status == "absent" for status in statuses):
+                return "absent"
+            if indexed_only is True and all(status in ("absent", "no_known_match") for status in statuses):
+                return "no_known_match"
+            return "unknown"
         except Exception:
             return "unknown"
 
-    def add(self, identity, owner, *, may_dispatch=None):
+    def add(self, identity, owner, *, may_dispatch=None, indexed_only=False):
         """One native call at most. Anything ambiguous requires reconciliation."""
         unknown = {"kind": "unknown", "sid": None}
         not_sent = {"kind": "not_sent", "sid": None}
@@ -347,13 +463,16 @@ class HostSubscriptionAdapter:
         initial = self.compatibility(owner)
         if not initial["ready"] or not _movie(identity):
             return not_sent
-        before = self.lookup_subscription(identity, owner)
+        before = self.lookup_subscription(identity, owner, indexed_only=indexed_only)
         if before["status"] == "existing":
             return {"kind": "existing", "sid": before["sid"]}
-        if before["status"] != "absent" or self.lookup_library(identity) != "absent":
+        if before["status"] != "absent":
+            return not_sent
+        library = self.lookup_library(identity, indexed_only=indexed_only, fresh=True)
+        if library != "absent" and not (indexed_only is True and library == "no_known_match"):
             return not_sent
         try:
-            if self.compatibility(owner) != initial or self.lookup_subscription(identity, owner)["status"] != "absent":
+            if self.compatibility(owner) != initial or self.lookup_subscription(identity, owner, indexed_only=indexed_only)["status"] != "absent":
                 return not_sent
             _permit(may_dispatch)
             sid, message = self._native().add(identity, owner, may_dispatch)
@@ -361,7 +480,7 @@ class HostSubscriptionAdapter:
                 return unknown
             kind = {"新增订阅成功": "added", "订阅已存在": "existing"}.get(message)
             if (kind is None or self.compatibility(owner) != initial
-                    or self.lookup_subscription(identity, owner) != {"status": "existing", "sid": sid}):
+                    or self.lookup_subscription(identity, owner, indexed_only=indexed_only) != {"status": "existing", "sid": sid}):
                 return {"kind": "unknown", "sid": sid}
             return {"kind": kind, "sid": sid}
         except _NotSent:

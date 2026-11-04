@@ -80,6 +80,21 @@ test('all missing requirements appear together, invalid clicks cannot save and d
   assert.equal(ui.emitted[1][1].unrelated_option, 'preserve-me')
 })
 
+test('the ranked shortcut prepares a visible draft and does not save or grant on open', async () => {
+  assert.equal(draftIssues({...full, fusion_execution_daily_limit:5}).length, 0)
+  for (const daily of [0, 4, 5, '3.0', true])
+    assert.ok(draftIssues({...full, fusion_execution_preset:'ranked', fusion_execution_daily_limit:daily})
+      .some(issue => issue.key === 'fusion_execution_daily_limit'))
+  vaLeaveBoard({target:'ranked'})
+  const ui = await open({...full, fusion_execution_daily_limit:5})
+  assert.deepEqual(ui.calls.map(call=>call[0]), ['GET'])
+  await ui.button('保存').props.onClick()
+  const update = ui.calls.find(call=>call[0] === 'PUT')
+  assert.equal(update[2].fusion_execution_preset,'ranked')
+  assert.equal(update[2].fusion_execution_daily_limit,3)
+  assert.ok(!ui.calls.some(call=>call[1] === scope+'authorize'))
+})
+
 test('saved settings get a separately reviewable digest, and only the explicit grant posts it', async () => {
   const ui = await open(full)
   ui.edit('fusion_execution_daily_limit', 3)

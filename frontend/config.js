@@ -25,9 +25,12 @@ function draftIssues(draft) {
   const sources = draft.fusion_execution_sources
   need(Array.isArray(sources) && sources.length === 1 && sources[0] === source,
     'fusion_execution_sources', '选择自动订阅来源')
-  need(['conservative', 'balanced'].includes(draft.fusion_execution_preset), 'fusion_execution_preset', '选择订阅预设')
-  need(['string', 'number'].includes(typeof draft.fusion_execution_daily_limit) &&
-    /^[1-5]$/.test(String(draft.fusion_execution_daily_limit)), 'fusion_execution_daily_limit', '每日上限需为 1–5 部')
+  const preset = draft.fusion_execution_preset
+  need(['ranked', 'conservative', 'balanced'].includes(preset), 'fusion_execution_preset', '选择订阅方式')
+  const daily = draft.fusion_execution_daily_limit
+  const max = preset === 'ranked' ? 3 : 5
+  need(['string', 'number'].includes(typeof daily) && /^[1-5]$/.test(String(daily)) && Number(daily) <= max,
+    'fusion_execution_daily_limit', '每日上限需为 1–' + max + ' 部')
   need(draft.fusion_execution_legacy_isolated === true, 'fusion_execution_legacy_isolated', '确认同来源旧订阅已停用')
   need(draft.fusion_execution_storage_verified === true, 'fusion_execution_storage_verified', '确认下载目录的存储映射')
   return issues
@@ -69,6 +72,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
     name: 'ViewingAssistantConfig', inheritAttrs: false, props: ['api', 'initialConfig'], emits: ['save', 'close', 'switch','layout'],
     setup(props, { emit }) {
       const boardBookmark = vaTakeHandoff('config')
+      let openRankedDraft = boardBookmark?.target === 'ranked'
       const draft = ref({}), form = ref([]), loaded = ref(false), busy = ref(false)
       const message = ref(''), serverIssue = ref(null), review = ref(null), saved = ref(false), conflict = ref(false)
       const container = ref(null)
@@ -112,6 +116,12 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
           draft.value = copy(response.model)
           original = JSON.stringify(draft.value)
           loaded.value = true
+          if (openRankedDraft) {
+            openRankedDraft = false
+            draft.value.fusion_execution_preset = 'ranked'
+            if (Number(draft.value.fusion_execution_daily_limit) > 3) draft.value.fusion_execution_daily_limit = 3
+            nextTick(() => focusField('fusion_execution_preset'))
+          }
           conflict.value = false
           serverIssue.value = null
         } catch { if (alive) message.value = '无法读取插件设置。' }
@@ -209,7 +219,9 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
       }
       const fieldProps = key => {
         const issue = issues.value.find(item => item.key === key)
-        return { disabled: busy.value, ...(issue ? { 'error-messages': issue.text } : {}) }
+        return { disabled: busy.value,
+          ...(key === 'fusion_execution_daily_limit' ? {max:draft.value.fusion_execution_preset === 'ranked' ? 3 : 5} : {}),
+          ...(issue ? { 'error-messages': issue.text } : {}) }
       }
       function switchPage() {
         if (!loaded.value || busy.value) return

@@ -29,7 +29,8 @@ from .providers import MTeamProvider, ProviderError, mteam_torrent_id
 from .subtitle_files import (SubtitleError, ExistingSubtitleError,
                              parse_download, select_candidate, save_sidecar)
 from .fusion.service import SnapshotService, DEFAULTS as FUSION_DEFAULTS
-from .fusion.ui import _caption, _card, _field, _node, _text, get_form_fields, profile_summary, render_page
+from .fusion.subtitle_ui import render_subtitles
+from .fusion.ui import _caption, _card, _field, _node, get_form_fields, profile_summary, render_page
 from .fusion.discovery import CandidateService
 from .fusion.follow_context import normalize_follow_context
 from .fusion.candidate_ui import CANDIDATE_DEFAULTS, get_candidate_form, render_candidates, browse_candidates, source_credits
@@ -106,7 +107,7 @@ class PtSubtitleFollowup(_PluginBase):
     plugin_name = "观影助手"
     plugin_desc = "按你的 Emby 口味，发现下一部想看的片。"
     plugin_icon = "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png"
-    plugin_version = "0.6.4"
+    plugin_version = "0.6.5"
     plugin_author = "Board-King"
     author_url = "https://github.com/Board-King"
     plugin_url = "https://github.com/Board-King/MoviePilot-ViewingAssistant-Market"
@@ -619,8 +620,8 @@ class PtSubtitleFollowup(_PluginBase):
     def _support(self):
         return {"image": _support_image()}
 
-    def _browse_candidates(self, kind: str = "all", period: str = "all", page: int = 1):
-        return browse_candidates(self._candidates.status(), self._artwork.decorate, kind, period, page)
+    def _browse_candidates(self, kind: str = "all", period: str = "all", page: int = 1, size: int | None = None):
+        return browse_candidates(self._candidates.status(), self._artwork.decorate, kind, period, page, size=size)
 
     def get_api(self):
         from fastapi import Depends, Header, HTTPException
@@ -677,7 +678,7 @@ class PtSubtitleFollowup(_PluginBase):
         profile = self._fusion.status()
         if profile.get("binding_verified") and profile.get("enabled"):
             status["profile_name"] = profile.get("user_name")
-        return {"page": render_execution(status, self.__class__.__name__)}
+        return {"page": render_execution(status, self.__class__.__name__, review=True)}
 
     def get_form(self):
         try:
@@ -698,20 +699,18 @@ class PtSubtitleFollowup(_PluginBase):
                     _field("VTextarea", "local_media_roots", "本地媒体库根目录", cols=12, rows=2,
                            hint="每行一个。115 STRM 沿用助手映射。"),
                 ]),
-                _caption("馒头原发布页 · 新下载及手选任务 · 保留已有字幕"),
+                _caption("馒头原发布页 · 保留已有字幕 · 沿用原时间轴 · 等待时照常上云"),
             ]),
         ])
         execution_form = get_execution_form() if self._execution else []
-        return [*get_form_fields(server_options), *get_candidate_form(), *execution_form, subtitle_form], {
+        return [*get_form_fields(server_options), *get_candidate_form(), *execution_form, subtitle_form, source_credits()], {
                     "enabled": False, "notify": False, "interval_hours": 3, "retry_days": 7, "local_media_roots": "",
                     **FUSION_DEFAULTS, **copy.deepcopy(CANDIDATE_DEFAULTS),
                     **(copy.deepcopy(EXECUTION_DEFAULTS) if self._execution else {})}
 
     def get_page(self):
-        labels = {"waiting_transfer": "等待入库", "waiting_subtitle": "等待配套字幕", "retry": "等待重试",
-                  "saved": "字幕已保存", "existing": "保留已有字幕", "expired": "补查已到期"}
         with self._lock:
-            tasks = sorted(copy.deepcopy(list(self._tasks.values())), key=lambda t: t["created"], reverse=True)[:100]
+            subtitles = render_subtitles(self._tasks.values(), self._enabled, rich=self.get_render_mode()[0] == "vue")
         candidate_page = render_candidates(self._artwork.decorate(self._candidates.status()), self.__class__.__name__)
         profile_status = self._fusion.status()
         profile_page = render_page(profile_status, self.__class__.__name__)
@@ -730,62 +729,11 @@ class PtSubtitleFollowup(_PluginBase):
         else:
             overview = [*profile_page, *candidate_page]
 
-        def needs_refresh(task):
-            return any("Emby刷新未确认" in str(target.get("refresh", ""))
-                       for target in task.get("targets", {}).values())
-
-        def task_row(task):
-            state = task["status"]
-            refresh_pending = needs_refresh(task)
-            color = "warning" if refresh_pending or state in {"retry", "expired"} else "success" if state in {"saved", "existing"} else "medium-emphasis"
-            refresh_messages = list(dict.fromkeys(
-                _text(str(target.get("refresh")), limit=240) for target in task.get("targets", {}).values()
-                if target.get("refresh")
-            ))[:3]
-            message = _text(task.get("message"), limit=360)
-            # Keep errors actionable. Routine queue activity belongs in its record.
-            issue = state in ("retry", "expired") or message.startswith("季集信息不完整")
-            return _node("div", props={"class": "py-3"}, content=[
-                _node("div", props={"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, content=[
-                    _node("div", _text(task["title"], "片名未知", 180), props={"class": "text-subtitle-2 text-break"}),
-                    _node("span", "需刷新 Emby" if refresh_pending else labels.get(state, "待处理"),
-                          props={"class": f"text-caption text-{color}"}),
-                ]),
-                *([_caption(message, "mt-1")] if issue and message else []),
-                *([_caption("请在 Emby 刷新这部作品。", "mt-1")] if refresh_pending else []),
-                _node("details", props={"class": "mt-2"}, content=[
-                    _node("summary", "补查记录", props={"class": "text-caption text-medium-emphasis cursor-pointer"}),
-                    _caption(f"{task['attempts']} 次补查 · {len(task['targets'])} 个文件", "mt-1"),
-                    *([_caption(message, "mt-1")] if not issue and message else []),
-                    *[_caption(note, "mt-1") for note in refresh_messages],
-                ]),
-            ])
-
-        def task_rows(rows):
-            content = []
-            for task in rows:
-                if content:
-                    content.append(_node("VDivider"))
-                content.append(task_row(task))
-            return content
-
-        pending = [task for task in tasks if task["status"] not in {"saved", "existing"} or needs_refresh(task)]
-        completed = [task for task in tasks if task["status"] in {"saved", "existing"} and not needs_refresh(task)]
-        subtitles = task_rows(pending) if pending else [
-            _caption("暂无待补查任务" if self._enabled else "未启用", "")]
-        if completed:
-            subtitles.append(_node("details", props={"class": "mt-3"}, content=[
-                _node("summary", f"已完成 · {len(completed)}", props={"class": "text-body-2 cursor-pointer"}),
-                *task_rows(completed),
-            ]))
-        subtitles.append(_node("details", props={"class": "mt-3"}, content=[
-            _node("summary", "补查范围", props={"class": "text-caption text-medium-emphasis cursor-pointer"}),
-            _caption("原发布页中文字幕 · 不阻塞上云 · 时间轴未校验", "mt-1"),
-        ]))
         execution_page = []
         if self._execution:
             execution_status = self._execution.status()
             if profile_status.get("binding_verified") and profile_status.get("enabled"):
                 execution_status["profile_name"] = profile_status.get("user_name")
             execution_page = render_execution(execution_status, self.__class__.__name__)
-        return [*overview, *execution_page, _card("配套字幕", subtitles), source_credits()]
+        activity = _node("div", props={"class": "va-activity-grid"}, content=[*execution_page, subtitles])
+        return [*overview, activity]

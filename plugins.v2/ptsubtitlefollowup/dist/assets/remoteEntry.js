@@ -21,6 +21,41 @@ const vaShellStyle = `
 .va-toolbar,.va-header{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:8px;background:rgb(var(--v-theme-surface))}
 .va-header{padding:8px 16px;border-bottom:1px solid rgba(var(--v-theme-on-surface),.1);min-height:48px}
 .va-shell .va-scroll{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain}
+.va-page .va-scroll,.va-config .va-scroll{container-type:inline-size}
+.va-shell .va-panel{min-width:0;box-shadow:none}
+.va-shell .va-panel>.v-card-title{letter-spacing:normal;font-weight:600;line-height:1.5}
+.va-activity-grid{display:grid;align-items:start;gap:16px;grid-template-columns:minmax(0,1fr);margin-bottom:16px}
+.va-activity-grid>.va-panel{margin:0!important}
+@container(min-width:48rem){.va-activity-grid:has(>:nth-child(2)){grid-template-columns:repeat(2,minmax(0,1fr))}}
+.va-ex-choice,.va-sub-itemline{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 10px}
+.va-ex-choice strong,.va-sub-itemline strong{font-weight:600;font-size:.9375rem;overflow-wrap:anywhere}
+.va-ex-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,7rem),1fr));gap:8px 16px;margin:10px 0}
+.va-ex-quota{display:inline-flex;align-items:center;gap:4px;margin-inline-start:auto;line-height:1.25;font-size:.8125rem;font-variant-numeric:tabular-nums}
+.va-ex-quota strong{font-size:1rem}
+.va-quota-meter{display:flex;gap:3px;margin-left:4px}
+.va-quota-meter>span{display:block;width:6px;height:14px;border-radius:3px;background:rgba(var(--v-theme-on-surface),.13)}
+.va-quota-meter>.is-used{background:rgb(var(--v-theme-primary))}
+.va-sub-legend,.va-sub-track,.va-sub-pages{display:flex;align-items:center;gap:6px}
+.va-sub-legend{flex-wrap:wrap}
+.va-subtitles [data-kind=saved]{--va-ink:var(--v-theme-success)}
+.va-subtitles [data-kind=existing]{--va-ink:var(--v-theme-primary)}
+.va-subtitles [data-kind=waiting]{--va-ink:var(--v-theme-on-surface)}
+.va-subtitles [data-kind=issue]{--va-ink:var(--v-theme-warning)}
+.va-sub-key,.va-sub-mark,.va-sub-pages button{border:1px solid transparent;display:inline-flex;align-items:center;justify-content:center;color:inherit;cursor:pointer}
+.va-sub-key{padding:4px 6px;gap:3px;border-radius:7px;font-size:.75rem;min-height:32px;white-space:nowrap}
+.va-sub-key svg{color:rgb(var(--va-ink))}
+.va-sub-key[aria-pressed=true]{border-color:rgba(var(--va-ink),.5);background:rgba(var(--va-ink),.09)}
+.va-sub-track{isolation:isolate;position:relative;min-width:0;min-height:36px;gap:4px;margin:4px 0 10px;overflow-x:auto;padding:3px}
+.va-sub-track:has(>:first-child)::before{content:'';position:absolute;z-index:-1;inset:50% 3px auto;height:2px;background:rgba(var(--v-theme-on-surface),.13)}
+.va-sub-mark{flex:none;width:32px;height:32px;border-radius:50%;background:rgb(var(--v-theme-surface));color:rgb(var(--va-ink));border-color:rgba(var(--va-ink),.5)}
+.va-sub-mark[aria-pressed=true]{outline:2px solid currentColor;outline-offset:1px}
+.va-sub-pages{justify-content:flex-end;font-size:.75rem;font-variant-numeric:tabular-nums}
+.va-sub-pages button{width:32px;height:32px;border-radius:8px;font-size:1.2rem}
+.va-sub-pages button:disabled{opacity:.35;cursor:default}
+.va-sub-selected{padding:8px 12px;background:rgba(var(--v-theme-on-surface),.035);border-radius:8px}
+.va-more{margin-top:8px;color:rgba(var(--v-theme-on-surface),.75);font-size:.8125rem}
+.va-more>summary{cursor:pointer;min-height:26px;line-height:26px}
+.va-more p{margin:4px 0;overflow-wrap:anywhere}
 .va-toolbar{padding:8px 16px max(8px,env(safe-area-inset-bottom));border-top:1px solid rgba(var(--v-theme-on-surface),.12)}
 .va-toolbar nav,.va-toolbar .va-actions{display:flex;align-items:center;gap:4px}
 .va-toolbar .va-actions{justify-content:flex-end;flex-wrap:wrap}
@@ -61,6 +96,8 @@ function vaFooter(Vue, {active,api,pluginId,Support,onData,onSettings,busy,actio
 // Render only this plugin's own JSON components. Media labels remain Vue text.
 function renderNode(Vue, node, ctx = {}) {
   if (!node || typeof node.component !== 'string') return null
+  if (ctx.SubtitleRail && Array.isArray(node.subtitle_records))
+    return Vue.h(ctx.SubtitleRail, {records:node.subtitle_records, enabled:node.subtitle_enabled})
   if (ctx.toolbarPrimary && node.props?.['data-va-primary'] === 'refresh-candidates') return null
   const name = node.component
   const native = /^[a-z][a-z0-9]*$/.test(name)
@@ -86,7 +123,7 @@ function renderNode(Vue, node, ctx = {}) {
     props.disabled = props.disabled || ctx.busy || false
     props.onClick = () => { if (!props.disabled) ctx.onAction(node.events.click) }
   }
-  if (props['data-va-settings'] && ctx.onSwitch) props.onClick = ctx.onSwitch
+  if (props['data-va-settings'] && ctx.onSwitch) props.onClick = () => ctx.onSwitch(props['data-va-settings'])
   const children = () => [...(node.text == null ? [] : [String(node.text)]),
     ...(node.content || []).map(child => renderNode(Vue, child, ctx))]
   return Vue.h(native ? name : Vue.resolveComponent(name), props, native ? children() : {default:children})
@@ -95,6 +132,7 @@ function renderNode(Vue, node, ctx = {}) {
 // The page never starts a task on mount. Refresh/authorization need a user click.
 function makePage(Vue, pluginId) {
   const Shelf = makeShelf(Vue)
+  const SubtitleRail = makeSubtitleRail(Vue)
   const Support = makeSupport(Vue)
   return {
     name:'ViewingAssistantPage', inheritAttrs:false,
@@ -105,9 +143,10 @@ function makePage(Vue, pluginId) {
       const resume = vaTakeHandoff('page')
       let selection = resume?.selection || {kind:'all',period:'all',page:1}
       let restoreScroll = resume?.top ?? null
-      function settings() {
+      function settings(target) {
         if (!props.show_switch || busy.value) return
-        vaLeaveBoard({selection:{...selection},top:scroller.value?.scrollTop || 0})
+        vaLeaveBoard({selection:{...selection},top:scroller.value?.scrollTop || 0,
+          target:target === 'ranked' ? 'ranked' : undefined})
         emit('switch')
       }
       function shelfReady(newSelection) {
@@ -172,7 +211,7 @@ function makePage(Vue, pluginId) {
             !rows.value && !error.value ? h('div',{role:'status',class:'py-4'},'正在读取看板…') : null,
             ...(rows.value || []).map(row => row.props?.['data-va-shelf']
               ? h(Shelf,{key:'shelf', initial:row,api:props.api,pluginId,resume:resume?.selection,onReady:shelfReady})
-              : renderNode(Vue,row,{pluginId, busy:busy.value,toolbarPrimary:true,onAction:action,
+              : renderNode(Vue,row,{pluginId, SubtitleRail, busy:busy.value,toolbarPrimary:true,onAction:action,
                 onSwitch:props.show_switch ? settings : undefined})),
           ]),
           error.value ? h('div',{role:'alert',class:'d-flex align-center ga-2 text-error px-4 py-1'},[
@@ -188,6 +227,15 @@ function makePage(Vue, pluginId) {
   }
 }
 
+const vaShelfStyle = `
+.va-shelf .va-reason-trigger{display:flex;flex-wrap:wrap;align-items:center;gap:2px 7px;min-height:32px;max-width:100%;text-align:start;font-variant-numeric:tabular-nums}
+.va-shelf .va-match,.va-shelf .va-rating{display:inline-flex;align-items:center;gap:3px;white-space:nowrap}
+.va-shelf .va-match{color:rgb(var(--v-theme-primary));font-weight:600}
+.va-shelf .va-match-track{width:15px;height:4px;overflow:hidden;border-radius:4px;background:rgba(var(--v-theme-primary),.17)}
+.va-shelf .va-match-track>span{display:block;height:100%;background:currentColor;border-radius:inherit}
+.va-shelf .va-rating{color:rgba(var(--v-theme-on-surface),.72)}
+`
+
 function makeShelf(Vue) {
   const {h, ref, computed, resolveComponent, watch, onUnmounted} = Vue
   return {
@@ -195,27 +243,34 @@ function makeShelf(Vue) {
     props:['initial','api','pluginId','resume'], emits:['ready'],
     setup(props,{emit}) {
       const kind = ref(props.resume?.kind || 'all'), period = ref(props.resume?.period || 'all'), page = ref(props.resume?.page || 1)
-      const view = ref(null), busy = ref(false), failed = ref(false), heading = ref(null)
+      const view = ref(null), busy = ref(false), failed = ref(false), heading = ref(null), ruler = ref(null)
+      const columns = ref(0)
+      const size = computed(() => columns.value ? columns.value * Math.min(4, Math.floor(20 / columns.value)) : 20)
       const reason = ref(null), dialog = ref(null), dismiss = ref(null)
       let opener = null
       const grid = computed(() => props.initial.content[1].content[0])
       const total = computed(() => view.value?.total ?? Number(props.initial.props['data-total']))
-      const pages = computed(() => view.value?.pages ?? Math.max(1,Math.ceil(total.value / props.initial.props['data-size'])))
-      let generation = 0
-      const ready = () => emit('ready',{kind:kind.value,period:period.value,page:page.value})
-      onUnmounted(() => { generation++ })
+      const pages = computed(() => view.value?.pages ?? Math.max(1,Math.ceil(total.value / size.value)))
+      let generation = 0, observer
+      const ready = () => emit('ready',{kind:kind.value,period:period.value,page:page.value,size:size.value})
+      onUnmounted(() => { generation++; observer?.disconnect() })
       async function read() {
         const stamp = ++generation
         failed.value = false
-        if (kind.value === 'all' && period.value === 'all' && page.value === 1) {
-          view.value = null; busy.value = false
+        const count = Number(props.initial.props['data-total'])
+        const offset = (page.value - 1) * size.value
+        if (kind.value === 'all' && period.value === 'all' && offset < count &&
+            grid.value.content.length >= Math.min(offset + size.value, count)) {
+          view.value = {cards:grid.value.content.slice(offset, offset + size.value),total:count,
+            pages:Math.max(1,Math.ceil(count / size.value))}
+          busy.value = false
           ready()
           return
         }
         busy.value = true
         try {
           const result = await props.api.get('plugin/' + props.pluginId + '/fusion/candidates/browse',
-            {params:{kind:kind.value, period:period.value, page:page.value}})
+            {params:{kind:kind.value, period:period.value, page:page.value, size:size.value}})
           if (stamp !== generation) return
           if (result?.success !== true || !Array.isArray(result.cards) || !Number.isInteger(result.page) ||
               !Number.isInteger(result.pages) || !Number.isInteger(result.total)) throw Error()
@@ -225,8 +280,23 @@ function makeShelf(Vue) {
         } catch { if (stamp === generation) failed.value = true }
         finally { if (stamp === generation) busy.value = false }
       }
-      watch(() => props.initial, read)
-      Vue.onMounted(read)
+      function measure(width) {
+        if (!(width > 0)) return
+        const next = Math.min(6, Math.max(width >= 210 ? 2 : 1, Math.floor((width + 14) / 174)))
+        if (columns.value === next) return
+        const oldSize = columns.value ? size.value : props.resume?.size || size.value
+        const offset = (page.value - 1) * oldSize
+        columns.value = next
+        page.value = Math.floor(offset / size.value) + 1
+        read()
+      }
+      watch(() => props.initial, () => { if (columns.value) read() })
+      Vue.onMounted(() => {
+        if (!ruler.value) return
+        measure(ruler.value.getBoundingClientRect().width)
+        observer = new ResizeObserver(entries => measure(entries[0].contentRect.width))
+        observer.observe(ruler.value)
+      })
       const button = (label, action, attrs = {}) => h(resolveComponent('VBtn'), {
         size:'small', variant:'text', onClick:action, ...attrs
       }, () => label)
@@ -263,12 +333,9 @@ function makeShelf(Vue) {
         return h('div',card.props,card.content.map(child=>{
           if (!child?.props?.['data-va-reason']) return renderNode(Vue,child)
           const summary = child.content[0]
-          return h('button',{type:'button',class:'va-reason-trigger text-caption text-primary',
-            'aria-label':summary.props['aria-label'],'aria-haspopup':'dialog',onClick:e=>explain(child,e),
-            style:'display:inline-flex;align-items:center;gap:4px;min-height:32px;max-width:100%;text-align:start'},[
-            icon('M4 18v-4m6 4V9m6 9V5',14),
-            h('span',{style:'overflow:hidden;text-overflow:ellipsis;white-space:nowrap'},summary.text)
-          ])
+          return h('button',{type:'button',class:'va-reason-trigger text-caption text-medium-emphasis',
+            'aria-label':summary.props['aria-label'],'aria-haspopup':'dialog',onClick:e=>explain(child,e)},
+            summary.content?.length ? summary.content.map(part=>renderNode(Vue,part)) : summary.text)
         }))
       }
       function reasonDialog() {
@@ -288,8 +355,9 @@ function makeShelf(Vue) {
           ]),h('div',{style:'padding:6px 18px 12px'},[renderNode(Vue,reason.value.content[1])])
         ]:[])
       }
-      return () => h('section',{class:'rounded-lg border px-4 py-4 mb-4','aria-label':'候选片单'},[
-        h('div',{class:'d-flex flex-wrap align-center justify-space-between ga-2 mb-3'}, [
+      return () => h('section',{class:'va-shelf rounded-lg border px-4 py-4 mb-4','aria-label':'候选片单'},[
+        h('style',null,vaShelfStyle),
+        h('div',{ref:ruler,class:'d-flex flex-wrap align-center justify-space-between ga-2 mb-3'}, [
           h('h2',{ref:heading,tabindex:-1,class:'text-subtitle-1 font-weight-bold',style:'scroll-margin-block-start:64px'},'候选片单'),
           h('div',{class:'d-flex flex-wrap ga-1',role:'group','aria-label':'发现时间'},[
             button('近 7 天新发现',()=>choose(kind.value,period.value === 'week' ? 'all':'week'),{
@@ -303,16 +371,92 @@ function makeShelf(Vue) {
             variant:kind.value===value?'tonal':'text'})),
           !busy.value && !failed.value ? h('span',{class:'ms-auto text-caption text-medium-emphasis'},total.value+' 部') : null
         ]),
-        busy.value ? h('p',{role:'status',class:'text-medium-emphasis py-3'},'正在读取片单…') :
+        busy.value || !columns.value ? h('p',{role:'status',class:'text-medium-emphasis py-3'},'正在读取片单…') :
         failed.value ? h('div',{role:'alert'},['片单暂时无法读取。',button('重试',read)]) :
         !total.value ? h('div',{class:'py-4'},['这个范围暂时没有候选。',button('查看全部',()=>choose('all','all'))]) :
-        h('div',grid.value.props,(view.value?.cards ?? grid.value.content).map(renderCard)),
+        h('div',{...grid.value.props,style:[grid.value.props.style,{gridTemplateColumns:'repeat('+columns.value+',minmax(0,1fr))'}]},
+          (view.value?.cards ?? []).map(renderCard)),
         !busy.value && !failed.value && pages.value > 1 ? h('nav',{'aria-label':'候选翻页',class:'d-flex align-center justify-center ga-2 mt-4'},[
           button('上一页',()=>choose(kind.value,period.value,page.value-1),{disabled:page.value<=1}),
           h('span',{class:'text-caption text-medium-emphasis','aria-live':'polite'},page.value+' / '+pages.value),
           button('下一页',()=>choose(kind.value,period.value,page.value+1),{disabled:page.value>=pages.value})
         ]) : null, reasonDialog()
       ])
+    }
+  }
+}
+
+function makeSubtitleRail(Vue) {
+  const {h, ref, computed, watch} = Vue
+  const kinds = {
+    saved:['已补齐', 'M5 12l4 4L19 6'],
+    existing:['已有字幕', 'M5 8h14M5 15h14'],
+    waiting:['等待中', 'M12 6v6l4 2'],
+    issue:['需留意', 'M12 5v8m0 4v1'],
+  }
+  const states = {saved:'已补齐', existing:'已有字幕', waiting_transfer:'等入库', waiting_subtitle:'等字幕',
+    retry:'待重试', expired:'已到期', unknown:'待核对'}
+  const bucket = state => state === 'saved' || state === 'existing' ? state :
+    state === 'waiting_transfer' || state === 'waiting_subtitle' ? 'waiting' : 'issue'
+  const icon = kind => h('svg', {viewBox:'0 0 24 24',width:16,height:16,fill:'none',stroke:'currentColor',
+    'stroke-width':2.3,'stroke-linecap':'round','stroke-linejoin':'round','aria-hidden':'true'}, [
+    h('path',{d:kinds[kind][1]})
+  ])
+  return {
+    name:'ViewingAssistantSubtitleRail',
+    props:{records:{type:Array,required:true},enabled:Boolean},
+    setup(props) {
+      const choice = ref('all'), index = ref(0), rail = ref(null), size = ref(10)
+      let observer
+      const items = computed(() => props.records.flatMap(record =>
+        record.marks.map(([state, name, note, refresh]) => ({record, state, name, note, refresh, kind:bucket(state)}))))
+      const counts = computed(() => {
+        const result = {saved:0, existing:0, waiting:0, issue:0}
+        for (const item of items.value) result[item.kind]++
+        return result
+      })
+      const visible = computed(() => choice.value === 'all' ? items.value : items.value.filter(i => i.kind === choice.value))
+      watch(() => props.records, () => { choice.value = 'all'; index.value = 0 })
+      Vue.onMounted(() => {
+        if (!rail.value || typeof ResizeObserver !== 'function') return
+        observer = new ResizeObserver(([entry]) => { size.value = Math.max(3, Math.min(16, Math.floor(entry.contentRect.width / 40))) })
+        observer.observe(rail.value)
+      })
+      Vue.onUnmounted(() => observer?.disconnect())
+      const toggle = kind => { choice.value = choice.value === kind ? 'all' : kind; index.value = 0 }
+      const title = item => [item.record.title, item.name].filter(Boolean).join(' · ')
+      const step = (direction, start) => { index.value = Math.max(0, Math.min(visible.value.length - 1, start + direction * size.value)) }
+      return () => {
+        const all = visible.value, start = Math.floor(index.value / size.value) * size.value
+        const selected = all[index.value]
+        const detail = selected && [selected.note, selected.record.note, selected.refresh].filter(Boolean)
+        // Several files in a release can complete independently. Each marker uses its own saved outcome.
+        return h('div', {class:'va-subtitles'}, [
+          h('div', {class:'va-sub-legend',role:'group','aria-label':'按字幕状态筛选'}, Object.keys(kinds)
+            .filter(kind => counts.value[kind]).map(kind => h('button', {type:'button',class:'va-sub-key',
+              'data-kind':kind,'aria-pressed':choice.value === kind,onClick:()=>toggle(kind)}, [
+              icon(kind), kinds[kind][0], h('strong', counts.value[kind])
+            ]))),
+          h('div', {ref:rail,class:'va-sub-track',role:'group','aria-label':'逐项字幕结果'}, all.slice(start, start + size.value)
+            .map((item, i) => h('button',{type:'button',class:'va-sub-mark','data-kind':item.kind,
+              'aria-pressed':start + i === index.value,'aria-label':title(item) + ' · ' + states[item.state],
+              title:title(item) + ' · ' + states[item.state],onClick:()=>{index.value = start + i}},[icon(item.kind)]))),
+          all.length > size.value ? h('nav',{class:'va-sub-pages','aria-label':'字幕记录翻页'}, [
+            h('button',{type:'button',disabled:start === 0,onClick:()=>step(-1,start),'aria-label':'上一组记录'},'‹'),
+            h('span',(start + 1) + '–' + Math.min(all.length, start + size.value) + ' / ' + all.length),
+            h('button',{type:'button',disabled:start + size.value >= all.length,onClick:()=>step(1,start),'aria-label':'下一组记录'},'›'),
+          ]) : null,
+          selected ? h('article',{class:'va-sub-selected','aria-live':'polite'}, [
+            h('div',{class:'va-sub-itemline'},[h('strong',title(selected)),
+              h('span',{class:'text-caption text-medium-emphasis'},states[selected.state])]),
+            selected.refresh.includes('Emby刷新未确认') ? h('p',{class:'text-caption text-warning'},'请在 Emby 刷新该作品。') : null,
+            h('details',{key:start + ':' + index.value + ':' + choice.value,class:'va-more'},[
+              h('summary','补查记录'), h('p',[selected.record.checked,selected.record.attempts + ' 次补查'].filter(Boolean).join(' · ')),
+              ...Array.from(new Set(detail)).map(note => h('p',note)),
+            ])
+          ]) : h('div',{class:'text-body-2 text-medium-emphasis'},props.enabled ? '暂无补查记录' : '字幕补查已关闭')
+        ])
+      }
     }
   }
 }
@@ -420,9 +564,12 @@ function draftIssues(draft) {
   const sources = draft.fusion_execution_sources
   need(Array.isArray(sources) && sources.length === 1 && sources[0] === source,
     'fusion_execution_sources', '选择自动订阅来源')
-  need(['conservative', 'balanced'].includes(draft.fusion_execution_preset), 'fusion_execution_preset', '选择订阅预设')
-  need(['string', 'number'].includes(typeof draft.fusion_execution_daily_limit) &&
-    /^[1-5]$/.test(String(draft.fusion_execution_daily_limit)), 'fusion_execution_daily_limit', '每日上限需为 1–5 部')
+  const preset = draft.fusion_execution_preset
+  need(['ranked', 'conservative', 'balanced'].includes(preset), 'fusion_execution_preset', '选择订阅方式')
+  const daily = draft.fusion_execution_daily_limit
+  const max = preset === 'ranked' ? 3 : 5
+  need(['string', 'number'].includes(typeof daily) && /^[1-5]$/.test(String(daily)) && Number(daily) <= max,
+    'fusion_execution_daily_limit', '每日上限需为 1–' + max + ' 部')
   need(draft.fusion_execution_legacy_isolated === true, 'fusion_execution_legacy_isolated', '确认同来源旧订阅已停用')
   need(draft.fusion_execution_storage_verified === true, 'fusion_execution_storage_verified', '确认下载目录的存储映射')
   return issues
@@ -464,6 +611,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
     name: 'ViewingAssistantConfig', inheritAttrs: false, props: ['api', 'initialConfig'], emits: ['save', 'close', 'switch','layout'],
     setup(props, { emit }) {
       const boardBookmark = vaTakeHandoff('config')
+      let openRankedDraft = boardBookmark?.target === 'ranked'
       const draft = ref({}), form = ref([]), loaded = ref(false), busy = ref(false)
       const message = ref(''), serverIssue = ref(null), review = ref(null), saved = ref(false), conflict = ref(false)
       const container = ref(null)
@@ -507,6 +655,12 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
           draft.value = copy(response.model)
           original = JSON.stringify(draft.value)
           loaded.value = true
+          if (openRankedDraft) {
+            openRankedDraft = false
+            draft.value.fusion_execution_preset = 'ranked'
+            if (Number(draft.value.fusion_execution_daily_limit) > 3) draft.value.fusion_execution_daily_limit = 3
+            nextTick(() => focusField('fusion_execution_preset'))
+          }
           conflict.value = false
           serverIssue.value = null
         } catch { if (alive) message.value = '无法读取插件设置。' }
@@ -604,7 +758,9 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
       }
       const fieldProps = key => {
         const issue = issues.value.find(item => item.key === key)
-        return { disabled: busy.value, ...(issue ? { 'error-messages': issue.text } : {}) }
+        return { disabled: busy.value,
+          ...(key === 'fusion_execution_daily_limit' ? {max:draft.value.fusion_execution_preset === 'ranked' ? 3 : 5} : {}),
+          ...(issue ? { 'error-messages': issue.text } : {}) }
       }
       function switchPage() {
         if (!loaded.value || busy.value) return

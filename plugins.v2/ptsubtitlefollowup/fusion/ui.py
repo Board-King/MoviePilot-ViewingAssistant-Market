@@ -113,7 +113,7 @@ def _chip(text, color="secondary"):
 
 
 def _card(title, children):
-    return _node("VCard", props={"variant": "flat", "border": True, "class": "rounded-lg mb-4"}, content=[
+    return _node("VCard", props={"variant": "flat", "border": True, "class": "va-panel rounded-lg mb-4"}, content=[
         _node("VCardTitle", title, props={"class": "text-subtitle-1 pt-4 px-4"}),
         _node("VCardText", props={"class": "px-4 pb-4"}, content=children),
     ])

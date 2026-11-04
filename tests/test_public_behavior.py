@@ -27,6 +27,34 @@ def nodes(tree):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_responsive_pages_keep_unique_ranks_through_the_final_partial_row(self):
+        rows = [{"title": str(i), "media_type": "movie" if i % 2 else "tv"} for i in range(45)]
+        for size in (8, 12, 16, 18, 20):
+            with self.subTest(size=size):
+                titles = []
+                for page in range(1, (22 + size - 1) // size + 1):
+                    result = browse_candidates({"candidates": rows}, lambda s: s, "movie", "all", page, size=size)
+                    self.assertTrue(result["success"])
+                    self.assertEqual(result["total"], 22)
+                    titles.extend(node["text"] for node in nodes(result["cards"])
+                                  if node.get("props", {}).get("class", "").startswith("text-subtitle-2 font-weight-bold mt-2"))
+                self.assertEqual(titles, [str(i) for i in range(1, 45, 2)])
+        for invalid in (0, 51, 3.5, True):
+            self.assertFalse(browse_candidates({"candidates": rows}, lambda s: s, size=invalid)["success"])
+
+    def test_card_uses_taste_and_actual_votes_separately_and_omits_missing_signals(self):
+        row = {"title": "Fixture", "media_type": "movie", "taste_match": .811, "fusion_rank": .69,
+               "contributions": {"dimensions": [{"dimension": "genres", "matched_labels": ["Fixture genre"]}]},
+               "ratings": [{"provider": "themoviedb", "scale": 10, "value": 7.4, "count": 58}]}
+        def summary(item, personalized=True):
+            result = browse_candidates({"candidates": [item], "profile_available": personalized}, lambda s: s)
+            return next(node for node in nodes(result["cards"]) if node["component"] == "summary")["props"]["aria-label"]
+        self.assertIn("口味匹配 81.1/100", summary(row))
+        self.assertIn("TMDB 评分 7.4/10", summary(row))
+        self.assertNotIn("口味匹配", summary(row, False))
+        self.assertNotIn("口味匹配", summary({**row, "missing": ["profile_support_missing"]}))
+        self.assertNotIn("TMDB", summary({**row, "ratings": [{**row["ratings"][0], "count": 0}]}))
+
     def test_repeated_views_do_not_outweigh_a_favorite(self):
         timestamp = "2040-03-01T12:00:00Z"
         watched = {"entity_key": "fixture:film:one", "kind": "movie", "signal": "played",

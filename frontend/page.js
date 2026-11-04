@@ -1,6 +1,8 @@
 // Render only this plugin's own JSON components. Media labels remain Vue text.
 function renderNode(Vue, node, ctx = {}) {
   if (!node || typeof node.component !== 'string') return null
+  if (ctx.SubtitleRail && Array.isArray(node.subtitle_records))
+    return Vue.h(ctx.SubtitleRail, {records:node.subtitle_records, enabled:node.subtitle_enabled})
   if (ctx.toolbarPrimary && node.props?.['data-va-primary'] === 'refresh-candidates') return null
   const name = node.component
   const native = /^[a-z][a-z0-9]*$/.test(name)
@@ -26,7 +28,7 @@ function renderNode(Vue, node, ctx = {}) {
     props.disabled = props.disabled || ctx.busy || false
     props.onClick = () => { if (!props.disabled) ctx.onAction(node.events.click) }
   }
-  if (props['data-va-settings'] && ctx.onSwitch) props.onClick = ctx.onSwitch
+  if (props['data-va-settings'] && ctx.onSwitch) props.onClick = () => ctx.onSwitch(props['data-va-settings'])
   const children = () => [...(node.text == null ? [] : [String(node.text)]),
     ...(node.content || []).map(child => renderNode(Vue, child, ctx))]
   return Vue.h(native ? name : Vue.resolveComponent(name), props, native ? children() : {default:children})
@@ -35,6 +37,7 @@ function renderNode(Vue, node, ctx = {}) {
 // The page never starts a task on mount. Refresh/authorization need a user click.
 function makePage(Vue, pluginId) {
   const Shelf = makeShelf(Vue)
+  const SubtitleRail = makeSubtitleRail(Vue)
   const Support = makeSupport(Vue)
   return {
     name:'ViewingAssistantPage', inheritAttrs:false,
@@ -45,9 +48,10 @@ function makePage(Vue, pluginId) {
       const resume = vaTakeHandoff('page')
       let selection = resume?.selection || {kind:'all',period:'all',page:1}
       let restoreScroll = resume?.top ?? null
-      function settings() {
+      function settings(target) {
         if (!props.show_switch || busy.value) return
-        vaLeaveBoard({selection:{...selection},top:scroller.value?.scrollTop || 0})
+        vaLeaveBoard({selection:{...selection},top:scroller.value?.scrollTop || 0,
+          target:target === 'ranked' ? 'ranked' : undefined})
         emit('switch')
       }
       function shelfReady(newSelection) {
@@ -112,7 +116,7 @@ function makePage(Vue, pluginId) {
             !rows.value && !error.value ? h('div',{role:'status',class:'py-4'},'正在读取看板…') : null,
             ...(rows.value || []).map(row => row.props?.['data-va-shelf']
               ? h(Shelf,{key:'shelf', initial:row,api:props.api,pluginId,resume:resume?.selection,onReady:shelfReady})
-              : renderNode(Vue,row,{pluginId, busy:busy.value,toolbarPrimary:true,onAction:action,
+              : renderNode(Vue,row,{pluginId, SubtitleRail, busy:busy.value,toolbarPrimary:true,onAction:action,
                 onSwitch:props.show_switch ? settings : undefined})),
           ]),
           error.value ? h('div',{role:'alert',class:'d-flex align-center ga-2 text-error px-4 py-1'},[

@@ -16,7 +16,7 @@ DIMENSIONS = ("genres", "languages", "decades", "actors", "directors", "keywords
 MAX_CANDIDATES = 500
 MAX_SOURCES = 16
 MAX_ITEMS = 5000
-ALGORITHM_VERSION = "p1b-shadow-v1"
+ALGORITHM_VERSION = "taste-first-v2"
 
 
 class CandidateError(ValueError):
@@ -362,4 +362,5 @@ def rank_candidates(pool, baseline=None, *, as_of):
                        "freshness": freshness, "consensus_bonus": consensus,
                        "fusion_rank": min(1.0, sum(contributions[key] for key in ("taste", "source", "freshness", "consensus"))),
                        "ratings": ratings, "contributions": contributions, "reasons": reasons, "missing": missing})
-    return sorted(ranked, key=lambda row: (row["intent_kind"] != "explicit_want", -row["fusion_rank"], row["entity_key"]))
+    return sorted(ranked, key=lambda row: (row["intent_kind"] != "explicit_want", -row["taste_match"],
+                                           -row["fusion_rank"], row["entity_key"]))

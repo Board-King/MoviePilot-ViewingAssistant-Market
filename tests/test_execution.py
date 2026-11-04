@@ -65,16 +65,16 @@ class Host:
     def compatibility(self, owner):
         return {"ready": self.compatible, "version": self.version, "host_key": self.host_key, "owner_key": self.owner_key}
 
-    def lookup_subscription(self, identity, owner):
+    def lookup_subscription(self, identity, owner, *, indexed_only=False):
         if self.lookup_hook:
             self.lookup_hook(identity)
         sid = self.ledger.get((owner, identity["media_id"]))
         return {"status": "existing" if sid else "absent", "sid": sid}
 
-    def lookup_library(self, identity):
+    def lookup_library(self, identity, *, indexed_only=False):
         return self.libs.get(identity["media_id"], "absent")
 
-    def add(self, identity, owner, *, may_dispatch):
+    def add(self, identity, owner, *, may_dispatch, indexed_only=False):
         if self.add_hook:
             return self.add_hook(identity, owner, may_dispatch)
         if not may_dispatch():
@@ -231,6 +231,146 @@ class ExecutionTests(unittest.TestCase):
         self.host.ledger.clear()
         self.service.tick()
         self.assertEqual(self.host.dispatched, [])
+
+    def ranked(self, limit=3):
+        self.config.update(fusion_execution_preset="ranked", fusion_execution_daily_limit=limit)
+        self.service.configure(self.config)
+
+    def test_actual_scan_records_disjoint_movie_outcomes_and_untouched_candidates(self):
+        self.ranked()
+        self.candidates = [self.candidate(str(i)) for i in range(10, 16)]
+        self.candidates.append(copy.deepcopy(self.candidates[0]))
+        self.host.ledger[("FixtureViewer", "10")] = 81
+        self.host.libs.update({"11": "present", "12": "unknown"})
+        self.arm()
+        self.assertIsNone(self.service.status()["last_scan"])
+        self.service.tick()
+        row = self.service.status()["last_scan"]
+        self.assertEqual((row["candidates"], row["eligible"], row["checked"]), (6, 6, 4))
+        self.assertEqual((row["subscribed"], row["owned"], row["library_unknown"], row["unseen"]), (1, 1, 1, 2))
+        self.assertEqual((row["new"], row["remaining"]), (1, 2))
+        self.assertNotIn("scope", row)
+        self.assertEqual(self.create().status()["last_scan"], row)
+        self.service.revoke()
+        self.assertIsNone(self.service.status()["last_scan"])
+
+    def test_scan_reports_which_gate_excluded_each_unique_movie_and_distinguishes_missing_inputs(self):
+        self.candidates = [self.candidate(str(i)) for i in range(10, 14)]
+        self.candidates[0]["taste_match"] = .6
+        self.candidates[1]["sources"][0]["metadata"]["ratings"][0]["value"] = 7.9
+        self.candidates[2]["contributions"] = {}
+        self.candidates[3]["sources"][0]["observed_at"] = "2020-01-01T00:00:00Z"
+        self.arm()
+        self.service.tick()
+        row = self.service.status()["last_scan"]
+        self.assertEqual([row[k] for k in ("candidates","eligible","checked","match","rating","evidence","metadata")],
+                         [4, 0, 0, 1, 1, 1, 1])
+        self.service._candidates = lambda: {"enabled":True, "profile_available":True, "sources":[]}
+        self.service.tick()
+        row = self.service.status()["last_scan"]
+        self.assertEqual(row["input"], "source")
+        self.assertNotIn("candidates", row)
+
+    def test_conflict_is_not_counted_as_existing_or_new_and_queued_success_is_disjoint(self):
+        self.ranked()
+        self.candidates = [self.candidate(str(i)) for i in range(10, 14)]
+        original = self.host.lookup_subscription
+        def lookup(identity, owner, **kwargs):
+            if identity["media_id"] == "10":
+                return {"status": "conflict", "sid": None}
+            return original(identity, owner, **kwargs)
+        self.host.lookup_subscription = lookup
+        self.arm()
+        self.service.tick()
+        row = self.service.status()["last_scan"]
+        self.assertEqual((row["conflict"], row["new"], row["subscribed"], row["remaining"]), (1, 3, 0, 0))
+        self.service.tick()  # Quota guard must not pretend it screened another set of films.
+        self.assertEqual(self.service.status()["last_scan"], row)
+
+    def test_ranked_fills_remaining_slots_by_match_without_public_rating_cutoff(self):
+        self.ranked()
+        self.candidates = [self.candidate(str(i)) for i in range(10, 17)]
+        for row, taste in zip(self.candidates, (.52, .60, .59, .80, .63, .79, .77)):
+            row.update(taste_match=taste, confidence=.05)
+            row["sources"][0]["metadata"]["ratings"] = []
+        self.candidates[6]["sources"][0]["metadata"] = copy.deepcopy(self.candidate("16")["sources"][0]["metadata"])
+        self.candidates[6]["sources"][0]["metadata"]["ratings"][0]["value"] = 6.12
+        self.host.ledger[("FixtureViewer", "13")] = 91
+        self.host.libs["15"] = "present"
+        self.arm()
+        self.service.tick()
+        self.service.tick()
+        self.service.tick()
+        self.assertEqual(self.host.dispatched, [("FixtureViewer", i) for i in ("16", "14", "11")])
+        self.assertEqual(self.service.status()["used_today"], 3)
+
+    def test_ranked_requires_new_grant_and_counts_existing_quota(self):
+        self.config["fusion_execution_preset"] = "balanced"
+        self.service.configure(self.config)
+        old_digest = self.arm()
+        self.assertEqual(self.store.record["grant"]["scope"]["policy_version"], execution.POLICY_VERSION)
+        self.service.tick()
+        self.candidates = [self.candidate(str(i)) for i in range(11, 15)]
+        self.ranked()
+        self.assertFalse(self.service.authorize(old_digest)["success"])
+        self.service.tick()
+        self.assertEqual(len(self.host.dispatched), 1)
+        self.arm()
+        self.assertEqual(self.store.record["grant"]["scope"]["policy_version"], execution.RANKED_POLICY_VERSION)
+        self.service.tick()
+        self.assertEqual([i for _, i in self.host.dispatched], ["10", "11", "12"])
+        self.assertEqual(self.service.status()["used_today"], 3)
+
+    def test_ranked_keeps_source_evidence_guards_and_only_accepts_one_to_three_slots(self):
+        self.ranked(4)
+        self.assertEqual(self.service.preflight(self.config), {"success": False, "reason": "INVALID_POLICY"})
+        self.ranked(2)
+        self.candidates = [self.candidate(str(i)) for i in range(10, 15)]
+        self.candidates[0]["contributions"] = {}
+        self.candidates[1]["sources"][0]["source_id"] = "unapproved"
+        self.candidates[2]["sources"][0]["observed_at"] = "2020-01-01T00:00:00Z"
+        self.candidates[3]["state"] = "HOLD"
+        self.arm()
+        self.space["status"] = "low"
+        self.service.tick()
+        self.assertFalse(self.host.dispatched)
+        self.space["status"] = "ready"
+        self.service.tick()
+        self.assertEqual(self.host.dispatched, [("FixtureViewer", "14")])
+
+    def test_ranked_ties_follow_shelf_order_and_unknown_first_add_stops_batch(self):
+        self.ranked()
+        self.candidates = [self.candidate(str(i)) for i in (73, 91, 11, 92)]
+        self.arm()
+        def timeout(identity, owner, may_dispatch):
+            self.assertTrue(may_dispatch())
+            self.host.dispatched.append((owner, identity["media_id"]))
+            raise TimeoutError()
+        self.host.add_hook = timeout
+        self.service.tick()
+        self.service.tick()
+        self.assertEqual(self.host.dispatched, [("FixtureViewer", "73")])
+        self.assertEqual(self.service.status()["unknown_count"], 1)
+
+    def test_ranked_rescans_from_best_when_day_or_rank_changes(self):
+        for refresh in ("new_day", "new_order"):
+            with self.subTest(refresh=refresh):
+                self.setUp()
+                self.ranked()
+                self.candidates = [self.candidate(str(i)) for i in range(10, 20)]
+                self.host.libs = {str(i): "present" for i in range(10, 14)}
+                self.arm()
+                self.service.tick()
+                self.assertFalse(self.host.dispatched)
+                if refresh == "new_day":
+                    self.now += 120
+                    self.host.libs.clear()
+                    first = "10"
+                else:
+                    self.candidates[8]["taste_match"] = .99
+                    first = "18"
+                self.service.tick()
+                self.assertEqual(self.host.dispatched[0], ("FixtureViewer", first))
 
     def test_timeout_after_host_commit_is_confirmed_by_read_without_second_add(self):
         self.arm()

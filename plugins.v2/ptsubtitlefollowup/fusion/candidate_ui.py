@@ -59,9 +59,9 @@ _TMDB_LOGO = (
 
 
 def source_credits():
-    """Shared by the native and Vue data pages, including plugin clones."""
+    """Data attribution in settings, including plugin clones."""
     return _node("details", props={"class":"mt-2 px-2"}, content=[
-        _node("summary", "鸣谢", props={"class":"text-caption text-medium-emphasis cursor-pointer"}),
+        _node("summary", "关于与数据来源", props={"class":"text-caption text-medium-emphasis cursor-pointer"}),
         _node("a", props={"href":"https://www.themoviedb.org/", "target":"_blank", "rel":"noopener noreferrer",
                           "class":"d-inline-block mt-3"}, content=[
             _node("img", props={"src":"data:image/svg+xml;base64," + _TMDB_LOGO, "alt":"The Movie Database (TMDB)",
@@ -340,11 +340,17 @@ def _badge(label, accent=False):
                  f"background:rgba(var(--v-theme-{color}),.08);overflow-wrap:anywhere;font-size:.82rem"})
 
 
-def _score_row(candidate, key, label):
+def _score(candidate, key):
     value = candidate.get(key)
     if type(value) not in (int, float) or not 0 <= value <= 1:
         return None
-    score = f"{value * 100:.1f}".removesuffix(".0")
+    return f"{value * 100:.1f}".removesuffix(".0")
+
+
+def _score_row(candidate, key, label):
+    score = _score(candidate, key)
+    if score is None:
+        return None
     return _node("div", props={"class": "va-score", "style": "display:grid;grid-template-columns:auto minmax(32px,1fr) 4.5ch;"
                     "align-items:center;gap:12px;font-size:.84rem"}, content=[
         _node("span", label), _node("div", props={"aria-hidden": "true", "style": "height:6px;border-radius:8px;"
@@ -388,10 +394,28 @@ def _reason_panel(candidate, title, personalized, season_note):
         parts.append(_caption("；".join(notes), ""))
     if not parts:
         parts.append(_caption("暂无可展示的推荐依据", ""))
-    lead = next((groups[key][0] for key in ("genres", "directors", "actors", "decades", "languages", "keywords") if key in groups), "")
+    summary = []
+    accessible = []
+    match = _score(candidate, "taste_match") if personalized and groups and not no_evidence else None
+    if match is not None:
+        accessible.append(f"口味匹配 {match}/100")
+        summary.append(_node("span", props={"class": "va-match", "title": accessible[-1]},
+            content=[_node("span", props={"class": "va-match-track", "aria-hidden": "true"}, content=[
+                _node("span", props={"style": f"width:{match}%"})]), _node("span", f"匹配 {match}")]))
+    ratings = candidate.get("ratings")
+    for rating in ratings if isinstance(ratings, list) else []:
+        if not isinstance(rating, dict) or rating.get("provider") != "themoviedb" or rating.get("scale") != 10:
+            continue
+        value = rating.get("value")
+        if type(value) in (int, float) and 0 <= value <= 10 and rating.get("count") != 0:
+            accessible.append(f"TMDB 评分 {value:.1f}/10")
+            summary.append(_node("span", props={"class": "va-rating", "title": accessible[-1]},
+                content=[_node("span", "★", props={"aria-hidden": "true"}), _node("span", f"{value:.1f}")]))
+            break
+    accessible.append(f"查看{title}的推荐依据")
     return _node("details", props={"class": "mt-1", "data-va-reason": title}, content=[
-        _node("summary", "口味相合 · " + lead if lead else "推荐依据",
-              props={"class": "text-caption text-medium-emphasis cursor-pointer", "aria-label": f"{title}的推荐依据"}),
+        _node("summary", None if summary else "推荐依据", content=summary,
+              props={"class": "text-caption text-medium-emphasis cursor-pointer", "aria-label": "，".join(accessible)}),
         _node("div", props={"style": "display:grid;gap:16px;padding-block:8px;min-width:0"}, content=parts)])
 
 
@@ -579,9 +603,10 @@ def render_candidates(status, plugin_id="PtSubtitleFollowup"):
     return page
 
 
-def browse_candidates(status, decorate, kind="all", period="all", page=1, *, now=None):
+def browse_candidates(status, decorate, kind="all", period="all", page=1, *, size=None, now=None):
     """Filter the entire current pool first. A weekly discovery is its first local observation."""
-    if kind not in ("all", "movie", "tv") or period not in ("all", "week") or type(page) is not int or page < 1:
+    if (kind not in ("all", "movie", "tv") or period not in ("all", "week") or type(page) is not int or page < 1
+            or (size is not None and (type(size) is not int or not 1 <= size <= 50))):
         return {"success": False}
     clock = (now or datetime.now(timezone.utc)).timestamp()
     def recently_seen(row):
@@ -592,8 +617,9 @@ def browse_candidates(status, decorate, kind="all", period="all", page=1, *, now
             return False
     rows = [row for row in status.get("candidates", []) if isinstance(row, dict)
             and (kind == "all" or row.get("media_type") == kind) and (period == "all" or recently_seen(row))]
-    size = status.get("display_limit", 20)
-    size = max(1, min(50, size)) if type(size) is int else 20
+    if size is None:
+        limit = status.get("display_limit", 20)
+        size = max(1, min(50, limit)) if type(limit) is int else 20
     pages = max(1, (len(rows) + size - 1) // size)
     actual = min(page, pages)
     start = (actual - 1) * size

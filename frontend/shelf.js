@@ -1,3 +1,12 @@
+const vaShelfStyle = `
+.va-shelf .va-reason-trigger{display:flex;flex-wrap:wrap;align-items:center;gap:2px 7px;min-height:32px;max-width:100%;text-align:start;font-variant-numeric:tabular-nums}
+.va-shelf .va-match,.va-shelf .va-rating{display:inline-flex;align-items:center;gap:3px;white-space:nowrap}
+.va-shelf .va-match{color:rgb(var(--v-theme-primary));font-weight:600}
+.va-shelf .va-match-track{width:15px;height:4px;overflow:hidden;border-radius:4px;background:rgba(var(--v-theme-primary),.17)}
+.va-shelf .va-match-track>span{display:block;height:100%;background:currentColor;border-radius:inherit}
+.va-shelf .va-rating{color:rgba(var(--v-theme-on-surface),.72)}
+`
+
 function makeShelf(Vue) {
   const {h, ref, computed, resolveComponent, watch, onUnmounted} = Vue
   return {
@@ -5,27 +14,34 @@ function makeShelf(Vue) {
     props:['initial','api','pluginId','resume'], emits:['ready'],
     setup(props,{emit}) {
       const kind = ref(props.resume?.kind || 'all'), period = ref(props.resume?.period || 'all'), page = ref(props.resume?.page || 1)
-      const view = ref(null), busy = ref(false), failed = ref(false), heading = ref(null)
+      const view = ref(null), busy = ref(false), failed = ref(false), heading = ref(null), ruler = ref(null)
+      const columns = ref(0)
+      const size = computed(() => columns.value ? columns.value * Math.min(4, Math.floor(20 / columns.value)) : 20)
       const reason = ref(null), dialog = ref(null), dismiss = ref(null)
       let opener = null
       const grid = computed(() => props.initial.content[1].content[0])
       const total = computed(() => view.value?.total ?? Number(props.initial.props['data-total']))
-      const pages = computed(() => view.value?.pages ?? Math.max(1,Math.ceil(total.value / props.initial.props['data-size'])))
-      let generation = 0
-      const ready = () => emit('ready',{kind:kind.value,period:period.value,page:page.value})
-      onUnmounted(() => { generation++ })
+      const pages = computed(() => view.value?.pages ?? Math.max(1,Math.ceil(total.value / size.value)))
+      let generation = 0, observer
+      const ready = () => emit('ready',{kind:kind.value,period:period.value,page:page.value,size:size.value})
+      onUnmounted(() => { generation++; observer?.disconnect() })
       async function read() {
         const stamp = ++generation
         failed.value = false
-        if (kind.value === 'all' && period.value === 'all' && page.value === 1) {
-          view.value = null; busy.value = false
+        const count = Number(props.initial.props['data-total'])
+        const offset = (page.value - 1) * size.value
+        if (kind.value === 'all' && period.value === 'all' && offset < count &&
+            grid.value.content.length >= Math.min(offset + size.value, count)) {
+          view.value = {cards:grid.value.content.slice(offset, offset + size.value),total:count,
+            pages:Math.max(1,Math.ceil(count / size.value))}
+          busy.value = false
           ready()
           return
         }
         busy.value = true
         try {
           const result = await props.api.get('plugin/' + props.pluginId + '/fusion/candidates/browse',
-            {params:{kind:kind.value, period:period.value, page:page.value}})
+            {params:{kind:kind.value, period:period.value, page:page.value, size:size.value}})
           if (stamp !== generation) return
           if (result?.success !== true || !Array.isArray(result.cards) || !Number.isInteger(result.page) ||
               !Number.isInteger(result.pages) || !Number.isInteger(result.total)) throw Error()
@@ -35,8 +51,23 @@ function makeShelf(Vue) {
         } catch { if (stamp === generation) failed.value = true }
         finally { if (stamp === generation) busy.value = false }
       }
-      watch(() => props.initial, read)
-      Vue.onMounted(read)
+      function measure(width) {
+        if (!(width > 0)) return
+        const next = Math.min(6, Math.max(width >= 210 ? 2 : 1, Math.floor((width + 14) / 174)))
+        if (columns.value === next) return
+        const oldSize = columns.value ? size.value : props.resume?.size || size.value
+        const offset = (page.value - 1) * oldSize
+        columns.value = next
+        page.value = Math.floor(offset / size.value) + 1
+        read()
+      }
+      watch(() => props.initial, () => { if (columns.value) read() })
+      Vue.onMounted(() => {
+        if (!ruler.value) return
+        measure(ruler.value.getBoundingClientRect().width)
+        observer = new ResizeObserver(entries => measure(entries[0].contentRect.width))
+        observer.observe(ruler.value)
+      })
       const button = (label, action, attrs = {}) => h(resolveComponent('VBtn'), {
         size:'small', variant:'text', onClick:action, ...attrs
       }, () => label)
@@ -73,12 +104,9 @@ function makeShelf(Vue) {
         return h('div',card.props,card.content.map(child=>{
           if (!child?.props?.['data-va-reason']) return renderNode(Vue,child)
           const summary = child.content[0]
-          return h('button',{type:'button',class:'va-reason-trigger text-caption text-primary',
-            'aria-label':summary.props['aria-label'],'aria-haspopup':'dialog',onClick:e=>explain(child,e),
-            style:'display:inline-flex;align-items:center;gap:4px;min-height:32px;max-width:100%;text-align:start'},[
-            icon('M4 18v-4m6 4V9m6 9V5',14),
-            h('span',{style:'overflow:hidden;text-overflow:ellipsis;white-space:nowrap'},summary.text)
-          ])
+          return h('button',{type:'button',class:'va-reason-trigger text-caption text-medium-emphasis',
+            'aria-label':summary.props['aria-label'],'aria-haspopup':'dialog',onClick:e=>explain(child,e)},
+            summary.content?.length ? summary.content.map(part=>renderNode(Vue,part)) : summary.text)
         }))
       }
       function reasonDialog() {
@@ -98,8 +126,9 @@ function makeShelf(Vue) {
           ]),h('div',{style:'padding:6px 18px 12px'},[renderNode(Vue,reason.value.content[1])])
         ]:[])
       }
-      return () => h('section',{class:'rounded-lg border px-4 py-4 mb-4','aria-label':'候选片单'},[
-        h('div',{class:'d-flex flex-wrap align-center justify-space-between ga-2 mb-3'}, [
+      return () => h('section',{class:'va-shelf rounded-lg border px-4 py-4 mb-4','aria-label':'候选片单'},[
+        h('style',null,vaShelfStyle),
+        h('div',{ref:ruler,class:'d-flex flex-wrap align-center justify-space-between ga-2 mb-3'}, [
           h('h2',{ref:heading,tabindex:-1,class:'text-subtitle-1 font-weight-bold',style:'scroll-margin-block-start:64px'},'候选片单'),
           h('div',{class:'d-flex flex-wrap ga-1',role:'group','aria-label':'发现时间'},[
             button('近 7 天新发现',()=>choose(kind.value,period.value === 'week' ? 'all':'week'),{
@@ -113,10 +142,11 @@ function makeShelf(Vue) {
             variant:kind.value===value?'tonal':'text'})),
           !busy.value && !failed.value ? h('span',{class:'ms-auto text-caption text-medium-emphasis'},total.value+' 部') : null
         ]),
-        busy.value ? h('p',{role:'status',class:'text-medium-emphasis py-3'},'正在读取片单…') :
+        busy.value || !columns.value ? h('p',{role:'status',class:'text-medium-emphasis py-3'},'正在读取片单…') :
         failed.value ? h('div',{role:'alert'},['片单暂时无法读取。',button('重试',read)]) :
         !total.value ? h('div',{class:'py-4'},['这个范围暂时没有候选。',button('查看全部',()=>choose('all','all'))]) :
-        h('div',grid.value.props,(view.value?.cards ?? grid.value.content).map(renderCard)),
+        h('div',{...grid.value.props,style:[grid.value.props.style,{gridTemplateColumns:'repeat('+columns.value+',minmax(0,1fr))'}]},
+          (view.value?.cards ?? []).map(renderCard)),
         !busy.value && !failed.value && pages.value > 1 ? h('nav',{'aria-label':'候选翻页',class:'d-flex align-center justify-center ga-2 mt-4'},[
           button('上一页',()=>choose(kind.value,period.value,page.value-1),{disabled:page.value<=1}),
           h('span',{class:'text-caption text-medium-emphasis','aria-live':'polite'},page.value+' / '+pages.value),

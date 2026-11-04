@@ -14,7 +14,7 @@ PLUGIN = ROOT / "plugins.v2" / PID.lower()
 ENTRY = "dist/assets/remoteEntry.js"
 QR = "assets/wechat-appreciation.jpg"
 QR_SHA = "6d4dc8e46531420a80d547e932aad910d5b0daf33edb8f12093e41b8a58e0ae1"
-FRONTEND = ("shell.js", "page.js", "shelf.js", "support.js", "config.js", "entry.js")
+FRONTEND = ("shell.js", "page.js", "shelf.js", "subtitles.js", "support.js", "config.js", "entry.js")
 
 
 def check(ok, message):

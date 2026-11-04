@@ -20,7 +20,9 @@ import time
 DATA_KEY = "fusion_execution_journal_v1"
 SOURCE = "tmdb_popular_movie"
 POLICY_VERSION = "tmdb-movie-policy-v1"
+RANKED_POLICY_VERSION = "tmdb-ranked-indexed-title-year-v1"
 PRESETS = {"conservative": (.78, .12), "balanced": (.68, .10)}
+RANKED = "ranked"
 TZ = timezone(timedelta(hours=8))
 MAX_INTENTS = 2000
 MAX_CHECKS = 4
@@ -68,6 +70,8 @@ def _settings(raw):
     limit = raw.get("fusion_execution_daily_limit", 1)
     if isinstance(limit, str) and re.fullmatch("[1-5]", limit):
         limit = int(limit)
+    preset = raw.get("fusion_execution_preset")
+    max_limit = 3 if preset == RANKED else 5
     user = raw.get("fusion_user_id")
     user = user.replace("-", "").lower() if isinstance(user, str) else ""
     libraries = raw.get("fusion_library_ids", [])
@@ -79,8 +83,8 @@ def _settings(raw):
     discovery = raw.get("fusion_discovery_sources", [SOURCE])
     return {"enabled": raw.get("fusion_execution_enabled") is True, "owner": _text(raw.get("fusion_execution_owner"), 128),
             "sources": [SOURCE] if raw.get("fusion_execution_sources") == [SOURCE] else [],
-            "daily_limit": limit if type(limit) is int and 1 <= limit <= 5 else 0,
-            "preset": raw.get("fusion_execution_preset") if raw.get("fusion_execution_preset") in ("conservative", "balanced") else None,
+            "daily_limit": limit if type(limit) is int and 1 <= limit <= max_limit else 0,
+            "preset": preset if isinstance(preset, str) and (preset == RANKED or preset in PRESETS) else None,
             "isolated": raw.get("fusion_execution_legacy_isolated") is True,
             "storage_verified": raw.get("fusion_execution_storage_verified") is True,
             "discovery": raw.get("fusion_discovery_enabled") is True and isinstance(discovery, list) and SOURCE in discovery,
@@ -124,8 +128,10 @@ def _compatible(adapter, owner):
     return {key: details[key] for key in keys}
 
 
-def _eligible(snapshot, config, now):
+def _eligible(snapshot, config, now, report=None):
     """Only the authorized source's own evidence may support dispatch."""
+    if report is not None:
+        report["input"] = "profile"
     if not isinstance(snapshot, dict) or snapshot.get("enabled") is not True or snapshot.get("profile_available") is not True:
         return []
     source_states = snapshot.get("sources")
@@ -134,13 +140,22 @@ def _eligible(snapshot, config, now):
         and source.get("stale") is False and not source.get("error_code") and not source.get("authentication_blocked")
         for source in source_states)
     if not available or not isinstance(snapshot.get("candidates"), list):
+        if report is not None:
+            report["input"] = "source"
         return []
-    taste_min, confidence_min = PRESETS[config["preset"]]
+    ranked = config["preset"] == RANKED
+    taste_min, confidence_min = (.5, 0) if ranked else PRESETS[config["preset"]]
     choices = []
+    decisions = {}
     for row in snapshot["candidates"][:500]:
         if not isinstance(row, dict) or row.get("provider") != "themoviedb" or row.get("media_type") != "movie":
             continue
         media_id = row.get("media_id")
+        if report is not None and isinstance(media_id, str) and re.fullmatch(r"[1-9][0-9]{0,19}", media_id):
+            origins = row.get("sources")
+            if isinstance(origins, list) and any(isinstance(s, dict) and s.get("source_id") == SOURCE
+                    and s.get("source_item_id") == media_id for s in origins[:16]):
+                decisions.setdefault(media_id, "metadata")
         if (not isinstance(media_id, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", media_id)
                 or row.get("entity_key") != f"themoviedb:movie:{media_id}" or row.get("state") != "SHADOW"
                 or row.get("season_hints") or row.get("metadata_conflict") or row.get("intent_kind") != "discovery"):
@@ -151,6 +166,8 @@ def _eligible(snapshot, config, now):
         taste, confidence = row.get("taste_match"), row.get("confidence")
         if (not _finite(taste) or not taste_min <= taste <= 1 or not _finite(confidence)
                 or not confidence_min <= confidence <= .6):
+            if media_id in decisions:
+                decisions[media_id] = "match"
             continue
         sources = row.get("sources")
         if not isinstance(sources, list):
@@ -164,10 +181,14 @@ def _eligible(snapshot, config, now):
         if not title or not _fresh(source.get("observed_at"), now) or not isinstance(metadata, dict):
             continue
         ratings = metadata.get("ratings")
+        rating_floor = 0 if ranked else 8
         scores = [r for r in ratings[:8] if isinstance(r, dict) and r.get("provider") == "themoviedb"
-                  and r.get("scale") == 10 and _finite(r.get("value")) and 8 <= r["value"] <= 10
+                  and r.get("scale") == 10 and _finite(r.get("value")) and rating_floor <= r["value"] <= 10
                   and _positive(r.get("count")) and _fresh(r.get("observed_at"), now)] if isinstance(ratings, list) else []
-        if len(scores) != 1:
+        score = scores[0] if len(scores) == 1 else None
+        if not ranked and score is None:
+            if media_id in decisions:
+                decisions[media_id] = "rating"
             continue
         contributions = row.get("contributions")
         dimensions = contributions.get("dimensions") if isinstance(contributions, dict) else None
@@ -183,15 +204,25 @@ def _eligible(snapshot, config, now):
             if isinstance(matched, list) and isinstance(supported, list):
                 evidence.extend([[name, label] for label in matched[:5] if _text(label, 128) and label in supported])
         if not evidence:
+            if media_id in decisions:
+                decisions[media_id] = "evidence"
             continue
         year = source.get("year")
         identity = {"provider": "themoviedb", "media_id": media_id, "media_type": "movie", "season": None,
                     "episode_group": None, "title": title, "year": year if type(year) is int and 1800 <= year <= 2200 else None}
-        audit = {"source": SOURCE, "observed_at": source["observed_at"], "rating": scores[0]["value"],
-                 "rating_count": scores[0]["count"], "taste": taste, "confidence": confidence,
+        audit = {"source": SOURCE, "observed_at": source["observed_at"], "rating": score["value"] if score else None,
+                 "rating_count": score["count"] if score else None, "taste": taste, "confidence": confidence,
                  "matched": evidence[:12], "algorithm": _text(row.get("algorithm_version"), 80),
                  "profile_as_of": _text(row.get("profile_as_of"), 64)}
         choices.append((identity, audit))
+    if report is not None:
+        decisions.update({identity["media_id"]: "eligible" for identity, _ in choices})
+        report.update(input="ready", candidates=len(decisions))
+        for gate in ("metadata", "match", "rating", "evidence", "eligible"):
+            report[gate] = sum(result == gate for result in decisions.values())
+    if ranked:
+        # The shelf snapshot orders ties by its combined score and stable entity key.
+        return sorted(choices, key=lambda item: -item[1]["taste"])
     return sorted(choices, key=lambda item: (-item[1]["taste"], -item[1]["confidence"], item[0]["media_id"]))
 
 
@@ -237,6 +268,7 @@ class ExecutionService:
         self._config, self._epoch, self._stopped = None, 0, False
         self._revoke_pending, self._last_fault = False, None
         self._cached_counts = {}
+        self._last_scan = None
 
     def _settings_now(self):
         with self._local:
@@ -259,7 +291,8 @@ class ExecutionService:
         if runtime is None or not _text(fence, 256):
             return None, "INCOMPATIBLE"
         fingerprint, reason = self._storage_scope()
-        return {**runtime, "owner": config["owner"], "policy_version": POLICY_VERSION,
+        return {**runtime, "owner": config["owner"],
+                "policy_version": RANKED_POLICY_VERSION if config["preset"] == RANKED else POLICY_VERSION,
                 "scope_fence": fence,
                 "binding": _digest([config["server_ref"], config["user_id"], config["library_mode"], config["library_ids"]]),
                 "sources": config["sources"], "preset": config["preset"], "daily_limit": config["daily_limit"],
@@ -402,6 +435,8 @@ class ExecutionService:
                 if not self._same_epoch(epoch):
                     return self._fault("SCOPE_CHANGED")
                 journal["grant"] = {"digest": expected_digest, "scope": scope, "at": self._clock()}
+                journal.pop("last_scan", None)
+                self._last_scan = None
                 journal["last_reason"], journal["scan_after"] = "AUTHORIZED", None
                 self._save(journal)
                 self._revoke_if_pending(journal)
@@ -446,7 +481,8 @@ class ExecutionService:
         try:
             current = _compatible(adapter, scope["owner"])
             same_host = current is not None and all(scope[key] == value for key, value in current.items())
-            check = adapter.lookup_subscription(copy.deepcopy(intent["identity"]), scope["owner"]) if same_host else {}
+            policy = {"indexed_only": True} if scope["preset"] == RANKED else {}
+            check = adapter.lookup_subscription(copy.deepcopy(intent["identity"]), scope["owner"], **policy) if same_host else {}
         except Exception:
             check = {}
         if (isinstance(check, dict) and check.get("status") == "existing" and _positive(check.get("sid"))
@@ -503,23 +539,64 @@ class ExecutionService:
         used, _ = self._counts(journal, scope)
         if used >= config["daily_limit"]:
             return self._record_reason(journal, "QUOTA_REACHED")
-        choices = _eligible(self._candidates(), config, self._clock())
+        report = {"scope": journal["grant"]["digest"], "at": self._clock()}
+        checked = {}
+        self._scan(journal, config, epoch, scope, adapter, report, checked)
+        if not self._matches(journal.get("grant"), scope):
+            return
+        if report["input"] == "ready":
+            report["checked"] = len(checked)
+            for result in ("new", "subscribed", "owned", "conflict", "library_unknown", "subscription_unknown", "unverified", "uncertain"):
+                report[result] = sum(value == result for value in checked.values())
+            report["unseen"] = report["eligible"] - report["previous"] - report["checked"]
+        report["remaining"] = max(0, config["daily_limit"] - self._counts(journal, scope)[0])
+        # The last completed scan is enough. Avoid rewriting the whole dispatch ledger every
+        # five minutes for an identical empty result; a restart displays the last persisted time.
+        previous = journal.get("last_scan")
+        self._last_scan = report
+        if not isinstance(previous, dict) or {**previous, "at": report["at"]} != report:
+            journal["last_scan"] = report
+            self._save(journal)
+
+    def _scan(self, journal, config, epoch, scope, adapter, report, checked):
+        try:
+            snapshot = self._candidates()
+        except Exception:
+            report["input"] = "source"
+            return self._record_reason(journal, "SOURCE_UNAVAILABLE")
+        choices = _eligible(snapshot, config, self._clock(), report)
         ids = [item[0]["media_id"] for item in choices]
+        ranked = config["preset"] == RANKED
+        policy = {"indexed_only": True} if ranked else {}
+        if ranked:
+            # A new Shanghai day or a revised ranking starts at the best match.
+            # Otherwise retain progress past already-owned or unverifiable titles.
+            window = _digest([_day(self._clock()), ids])
+            if journal.get("scan_window") != window:
+                journal["scan_window"], journal["scan_after"] = window, None
         start = ids.index(journal["scan_after"]) + 1 if journal.get("scan_after") in ids else 0
         choices = choices[start:] + choices[:start]
         choices = [item for item in choices if journal["intents"].get(_business(scope, item[0]), {}).get("state")
                    in (None, "CANCELLED")]
+        if report["input"] == "ready":
+            report["previous"] = len(set(ids)) - len({identity["media_id"] for identity, _ in choices})
         if not choices:
             return self._record_reason(journal, "NO_ELIGIBLE")
         held_reason = "HELD"
         for identity, audit in choices[:MAX_CHECKS]:
             journal["scan_after"] = identity["media_id"]
+            media_id = identity["media_id"]
+            if media_id in checked or journal["intents"].get(_business(scope, identity), {}).get("state") not in (None, "CANCELLED"):
+                continue
+            checked[media_id] = "unverified"
             try:
-                check = adapter.lookup_subscription(copy.deepcopy(identity), scope["owner"])
+                check = adapter.lookup_subscription(copy.deepcopy(identity), scope["owner"], **policy)
             except Exception:
                 held_reason = "SUBSCRIPTION_UNVERIFIED"
+                checked[media_id] = "subscription_unknown"
                 continue
             if isinstance(check, dict) and check.get("status") == "existing" and _positive(check.get("sid")):
+                checked[media_id] = "subscribed"
                 key = _business(scope, identity)
                 if key not in journal["intents"] and len(journal["intents"]) >= MAX_INTENTS:
                     return self._record_reason(journal, "JOURNAL_FULL")
@@ -529,17 +606,27 @@ class ExecutionService:
                 continue
             if not isinstance(check, dict) or check.get("status") != "absent":
                 held_reason = "SUBSCRIPTION_CONFLICT" if isinstance(check, dict) and check.get("status") == "conflict" else "SUBSCRIPTION_UNVERIFIED"
+                checked[media_id] = "conflict" if held_reason == "SUBSCRIPTION_CONFLICT" else "subscription_unknown"
                 continue
             try:
-                library = adapter.lookup_library(copy.deepcopy(identity))
-                if library != "absent":
+                library = adapter.lookup_library(copy.deepcopy(identity), **policy)
+                if library != "absent" and not (ranked and library == "no_known_match"):
                     held_reason = "LIBRARY_PRESENT" if library == "present" else "LIBRARY_UNVERIFIED"
+                    checked[media_id] = "owned" if library == "present" else "library_unknown"
                     continue
             except Exception:
                 held_reason = "LIBRARY_UNVERIFIED"
+                checked[media_id] = "library_unknown"
                 continue
             if self._dispatch(journal, config, epoch, scope, adapter, identity, audit):
-                return
+                state = journal["intents"].get(_business(scope, identity), {}).get("state")
+                checked[media_id] = {"CONFIRMED": "new", "EXISTING": "subscribed", "UNKNOWN":"uncertain",
+                                     "SUBMITTING":"uncertain"}.get(state, "unverified")
+                if not ranked or state not in ("CONFIRMED", "EXISTING"):
+                    return
+                if self._counts(journal, scope)[0] >= config["daily_limit"]:
+                    return self._record_reason(journal, "QUOTA_REACHED")
+                held_reason = journal["last_reason"]
         journal["last_reason"] = held_reason
         self._save(journal)
 
@@ -556,6 +643,7 @@ class ExecutionService:
                 "events": [{"state": state, "at": now}]}
 
     def _dispatch(self, journal, config, epoch, scope, adapter, identity, audit):
+        policy = {"indexed_only": True} if config["preset"] == RANKED else {}
         fresh = {row["media_id"]: (row, evidence) for row, evidence in _eligible(self._candidates(), config, self._clock())}
         if fresh.get(identity["media_id"]) != (identity, audit):
             return False
@@ -583,7 +671,7 @@ class ExecutionService:
         journal["intents"][key] = intent
         self._save(journal)
         try:
-            check = adapter.lookup_subscription(copy.deepcopy(identity), scope["owner"])
+            check = adapter.lookup_subscription(copy.deepcopy(identity), scope["owner"], **policy)
         except Exception:
             check = {}
         existing = isinstance(check, dict) and check.get("status") == "existing" and _positive(check.get("sid"))
@@ -612,7 +700,7 @@ class ExecutionService:
         # This is the only external dispatch site. Every exceptional path from
         # here is uncertain, even an apparently failed/empty host result.
         try:
-            outcome = adapter.add(copy.deepcopy(identity), scope["owner"], may_dispatch=may_dispatch)
+            outcome = adapter.add(copy.deepcopy(identity), scope["owner"], may_dispatch=may_dispatch, **policy)
         except Exception:
             outcome = {}
         sid = outcome.get("sid") if isinstance(outcome, dict) else None
@@ -623,7 +711,7 @@ class ExecutionService:
             return True
         if isinstance(outcome, dict) and outcome.get("kind") == "existing" and _positive(sid):
             try:
-                check = adapter.lookup_subscription(copy.deepcopy(identity), scope["owner"])
+                check = adapter.lookup_subscription(copy.deepcopy(identity), scope["owner"], **policy)
             except Exception:
                 check = {}
             if isinstance(check, dict) and check.get("status") == "existing" and check.get("sid") == sid and _positive(check["sid"]):
@@ -652,13 +740,34 @@ class ExecutionService:
         except Exception:
             return True
 
+    def _visible_scan(self, journal):
+        grant = journal["grant"]
+        scans = [s for s in (self._last_scan, journal.get("last_scan"))
+                 if isinstance(s, dict) and _equal(s.get("scope"), grant["digest"]) and _finite(s.get("at"))
+                 and s["at"] >= grant["at"] and s.get("input") in ("profile", "source", "ready")]
+        if not scans:
+            return None
+        scan = max(scans, key=lambda s: s["at"])
+        result = {"at": scan["at"], "input": scan["input"]}
+        fields = ["remaining"]
+        if scan["input"] == "ready":
+            fields += ["candidates", "metadata", "match", "rating", "evidence", "eligible",
+                       "previous", "checked", "new", "subscribed", "owned", "conflict", "library_unknown",
+                       "subscription_unknown", "unverified", "uncertain", "unseen"]
+        for field in fields:
+            count = scan.get(field)
+            if type(count) is not int or not 0 <= count <= 500:
+                return None
+            result[field] = count
+        return result
+
     def status(self):
         config, _, reason = self._settings_now()
         config = config or _settings({})
         result = {"enabled": config["enabled"], "armed": False, "state": "shadow", "owner": config["owner"],
                   "sources": config["sources"], "media_types": ["movie"], "daily_limit": config["daily_limit"],
                   "preset": config["preset"], "used_today": 0, "unknown_count": 0, "last_reason": reason,
-                  "recent": [], "authorization_digest": None, "can_authorize": False}
+                  "recent": [], "last_scan": None, "authorization_digest": None, "can_authorize": False}
         try:
             missing = hasattr(self._store, "exists") and not self._store.exists()
             with nullcontext() if missing else self._store.locked():
@@ -669,6 +778,8 @@ class ExecutionService:
                     result["authorization_digest"] = None if gate_reason else _digest(scope)
                     result["armed"] = self._matches(journal["grant"], scope)
                     result["can_authorize"] = not result["armed"] and gate_reason is None
+                    if result["armed"]:
+                        result["last_scan"] = self._visible_scan(journal)
                 if journal.get("grant") and not result["armed"] and reason != "PAUSED":
                     self._revoke_locked(journal)
                 used, unknown = self._counts(journal, scope)

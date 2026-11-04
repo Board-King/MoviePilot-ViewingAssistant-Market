@@ -76,6 +76,34 @@ class HostTests(unittest.TestCase):
             self.assertEqual(self.adapter.add(MOVIE, "FixtureOwner", may_dispatch=lambda: True)["kind"], "not_sent")
         self.assertEqual(self.native.calls, 0)
 
+    def test_ranked_compares_only_exact_douban_movie_ids_across_current_and_history(self):
+        a = row(tmdbid=None, media_source="douban", media_id="44", doubanid=44, mediaid="douban:44")
+        self.native.current = [a]
+        self.native.history = [{**a, "media_id": "72", "doubanid": 72, "mediaid": None}]
+        requested = []
+        def crosswalk(media_id):
+            requested.append(media_id)
+            return {"imdb": "tt1199123", "douban": "72"}
+        self.native.external_ids = crosswalk
+        self.assertEqual(self.adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "unknown")
+        ranked = lambda: self.adapter.lookup_subscription(MOVIE, "FixtureOwner", indexed_only=True)["status"]
+        self.assertEqual(ranked(), "conflict")
+        self.native.history = []
+        self.assertEqual(ranked(), "absent")
+        self.assertEqual(requested, ["123"])
+        self.native.current = [{**a, "doubanid": "15"}]
+        self.assertEqual(ranked(), "unknown")
+        self.native.current = [a]
+        self.native.external_ids = lambda media_id: {}
+        self.adapter._external_ids.cache_clear()
+        self.assertEqual(ranked(), "unknown")
+
+    def test_douban_lookup_accepts_only_its_movie_id_shapes(self):
+        for value in ("23", 23, "https://api.douban.com/movie/23"):
+            self.assertEqual(host._douban_movie_id({"id": value}), "23")
+        for value in (None, "movie 23", "https://example.test/movie/23", "https://api.douban.com/tv/23"):
+            self.assertIsNone(host._douban_movie_id({"id": value}))
+
     def test_ineligible_inputs_and_lost_authorization_never_call_native_add(self):
         for changed in ({"provider": "douban"}, {"season": 0}, {"media_type": "tv"},
                         {"episode_group": "x"}, {"media_id": True}, {"title": "bad\ninput"}):
@@ -103,6 +131,39 @@ class HostTests(unittest.TestCase):
             iterator = iter(answers)
             self.adapter._probe = lambda *_: next(iterator)
             self.assertEqual(self.adapter.lookup_library(MOVIE), expected)
+
+    def test_ranked_library_gaps_never_prove_full_absence(self):
+        def gap(identifier, **fields):
+            return dict(Id=str(identifier), Type="Movie", ProviderIds={}, **fields)
+        first = {"Items": [gap(1, OriginalTitle="ＳＹＮＴＨＥＴＩＣ", ProductionYear=2024),
+                           gap(2, Name="Different work")], "TotalRecordCount": 2}
+        rows = host._unidentified_movies(None, {}, first)
+        self.assertEqual(host._unidentified_match(rows, MOVIE), "unknown")
+        self.assertEqual(host._unidentified_match(rows, {**MOVIE, "title": "Different: Work (Extended)"}), "unknown")
+        self.assertEqual(host._unidentified_match(rows, {**MOVIE, "title": "Unrelated"}), "no_known_match")
+        self.assertEqual(host._unidentified_match([], MOVIE), "absent")
+        self.assertEqual(host._unidentified_match([(set(), None)], MOVIE), "unknown")
+        self.servers = [SERVER, SERVER]
+        for statuses, ranked, expected in ((["absent", "no_known_match"], False, "unknown"),
+                                           (["absent", "no_known_match"], True, "no_known_match"),
+                                           (["unknown", "no_known_match"], True, "unknown"),
+                                           (["no_known_match", "present"], True, "present")):
+            answers = iter(statuses)
+            self.adapter._probe = lambda *_: next(answers)
+            self.assertEqual(self.adapter.lookup_library(MOVIE, indexed_only=ranked), expected)
+
+    def test_unidentified_library_scan_requires_complete_consistent_pages(self):
+        items = [{"Type": "Movie", "Id": str(i), "ProviderIds": {}, "Name": "Sample"} for i in range(129)]
+        first = {"TotalRecordCount": 129, "Items": items[:128]}
+        for tail in ({"TotalRecordCount": 128, "Items": [items[-1]]}, {"TotalRecordCount": 129, "Items": []},
+                     {"TotalRecordCount": 129, "Items": [items[0]]},
+                     {"TotalRecordCount": 129, "Items": [{**items[-1], "ProviderIds": {"Tmdb": "45"}}]}):
+            with self.assertRaises(ValueError):
+                host._unidentified_movies(lambda *_: tail, {}, first)
+        def last_page(path, params):
+            self.assertEqual((path, params["StartIndex"]), ("/Items", 128))
+            return {"TotalRecordCount": 129, "Items": [items[-1]]}
+        self.assertEqual(len(host._unidentified_movies(last_page, {}, first)), 129)
 
     def test_add_readback_preexisting_and_unknown_after_commit(self):
         submit = lambda: self.adapter.add(MOVIE, "FixtureOwner", may_dispatch=lambda: True)
