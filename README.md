@@ -32,4 +32,4 @@ This product uses the TMDB API but is not endorsed or certified by TMDB.
 
 豆瓣待播剧集来源使用 RSSHub 提供的公开窗口。作品海报和资料随来源展示。
 
-[版本下载](https://github.com/Board-King/MoviePilot-ViewingAssistant-Market/releases) · [开发路线图](ROADMAP.md) · [维护与发版](MAINTAINING.md)
+[版本下载](https://github.com/Board-King/MoviePilot-ViewingAssistant-Market/releases) · [进化路线](ROADMAP.md) · [市场调研](docs/market-research.md) · [维护与发版](MAINTAINING.md)
