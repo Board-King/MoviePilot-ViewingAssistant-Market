@@ -15,7 +15,8 @@ import time
 
 from .emby import EmbyReadOnlyClient, EmbyReadError
 from .profile import SnapshotAccumulator, ProfileError
-from .tonight import select_tonight
+from .tonight import select_tonight, unavailable_choices
+from .choices import ChoiceStore, ChoiceError, scope_key
 from .ui import FORM_DEFAULTS as DEFAULTS
 
 
@@ -71,6 +72,7 @@ class SnapshotService:
         self._epoch, self._cancel = 0, threading.Event()
         self._config = normalize({})
         self._state = {}
+        self._choices = ChoiceStore(read, write, clock)
 
     def configure(self, raw):
         config = normalize(raw)
@@ -79,6 +81,7 @@ class SnapshotService:
             self._cancel.set()
             self._cancel = threading.Event()
             self._epoch += 1
+            self._choices.reset()
             self._config = config
             previous = self._read(DATA_KEY) or {}
             if not isinstance(previous, dict):
@@ -108,6 +111,7 @@ class SnapshotService:
         with self._lock:
             self._cancel.set()
             self._epoch += 1
+            self._choices.reset()
 
     @property
     def enabled(self):
@@ -170,7 +174,8 @@ class SnapshotService:
         except Exception:
             return {"success": False, "libraries": []}
 
-    def tonight(self, max_minutes: int = 0, chinese_subtitles: bool = False):
+    def tonight(self, max_minutes: int = 0, chinese_subtitles: bool = False,
+                mode: str = "discover", page: int = 1):
         """User-initiated library read. Never change a binding, snapshot or grant here."""
         if not self._run_lock.acquire(blocking=False):
             return {"success": False, "reason": "BUSY"}
@@ -185,12 +190,40 @@ class SnapshotService:
                     return {"success": False, "reason": "UNAVAILABLE"}
                 epoch, cancel, config, state = capture
                 baseline = None if self._profile_stale() else (state.get("profile") or {}).get("baseline")
+                choice_scope = scope_key(state["binding"], state["native_server_id"])
+                remembered = self._choices.snapshot(choice_scope)
             result = select_tonight(self._resolve(config["server_ref"]), server_id=state["native_server_id"],
                                     user_id=config["user_id"], scope=config["scope"], baseline=baseline,
                                     max_minutes=max_minutes, chinese_subtitles=chinese_subtitles,
-                                    stop_callback=cancel.is_set)
+                                    stop_callback=cancel.is_set, remembered=remembered, mode=mode, page=page)
             with self._lock:
-                return result if self._current(epoch, cancel) else {"success": False, "reason": "UNAVAILABLE"}
+                if not self._current(epoch, cancel):
+                    return {"success": False, "reason": "UNAVAILABLE"}
+                if mode in ("saved", "hidden") and result.get("reason") in ("LIBRARY_NOT_VISIBLE", "FORBIDDEN"):
+                    result = unavailable_choices(remembered, mode, page, result["reason"])
+                if result.get("success") is True:
+                    result["context"] = self._choices.offer(choice_scope, result["items"], remembered)
+                    result["counts"] = self._choices.counts(remembered)
+                return result
+        except ChoiceError as error:
+            return {"success": False, "reason": error.code}
+        except Exception:
+            return {"success": False, "reason": "UNAVAILABLE"}
+        finally:
+            self._run_lock.release()
+
+    def tonight_choice(self, payload):
+        """Record a displayed movie choice locally; no Emby or subscription writes."""
+        if not self._run_lock.acquire(blocking=False):
+            return {"success": False, "reason": "BUSY"}
+        try:
+            with self._lock:
+                if not self._capture() or not self._state.get("native_server_id"):
+                    return {"success": False, "reason": "STALE_CONTEXT"}
+                current_scope = scope_key(self._state["binding"], self._state["native_server_id"])
+                return self._choices.change(current_scope, payload)
+        except ChoiceError as error:
+            return {"success": False, "reason": error.code}
         except Exception:
             return {"success": False, "reason": "UNAVAILABLE"}
         finally:

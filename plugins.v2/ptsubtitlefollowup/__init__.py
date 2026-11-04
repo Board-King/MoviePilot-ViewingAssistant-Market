@@ -14,10 +14,11 @@ import threading
 import time
 from pathlib import Path
 from contextlib import contextmanager
+from typing import Literal
 
 import requests
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import settings
 from app.core.event import Event, eventmanager
@@ -49,6 +50,13 @@ class SeedRequest(BaseModel):
 
 class ExecutionApproval(BaseModel):
     expected_digest: str
+
+
+class TonightChoice(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    context: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    item_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    action: Literal["later", "hide", "clear"]
 
 
 def value(obj, key, default=None):
@@ -107,7 +115,7 @@ class PtSubtitleFollowup(_PluginBase):
     plugin_name = "观影助手"
     plugin_desc = "按你的 Emby 口味，发现下一部想看的片。"
     plugin_icon = "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png"
-    plugin_version = "0.7.0"
+    plugin_version = "0.7.1"
     plugin_author = "Board-King"
     author_url = "https://github.com/Board-King"
     plugin_url = "https://github.com/Board-King/MoviePilot-ViewingAssistant-Market"
@@ -651,6 +659,9 @@ class PtSubtitleFollowup(_PluginBase):
             fusion_routes.append({"path": path, "endpoint": endpoint, "methods": ["GET"], "auth": "bear",
                                   "summary": description,
                                   "dependencies": [Depends(get_current_active_superuser), Depends(signed_in)]})
+        fusion_routes.append({"path": "/fusion/tonight/choice", "endpoint": self._tonight_choice,
+                              "methods": ["POST"], "auth": "bear", "summary": "记住或撤销本人的选片选择",
+                              "dependencies": [Depends(get_current_active_superuser), Depends(signed_in)]})
         if self._execution:
             for name, endpoint, method in (("status", self._execution.status, "GET"),
                                            ("preflight", self._execution_preflight, "POST"),
@@ -668,6 +679,9 @@ class PtSubtitleFollowup(_PluginBase):
 
     def _authorize_execution(self, request: ExecutionApproval):
         return self._execution.authorize(request.expected_digest)
+
+    def _tonight_choice(self, request: TonightChoice):
+        return self._fusion.tonight_choice(request.model_dump())
 
     def _execution_preflight(self, draft: dict):
         # Do not contact Emby or inspect viewing records before a binding has been saved.

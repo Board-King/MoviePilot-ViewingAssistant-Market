@@ -10,6 +10,7 @@ from test_fusion_emby import OTHER_USER, REQUESTS, SERVER, USER, Response, Sessi
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins.v2/ptsubtitlefollowup"))
 with patch.dict(sys.modules, {"requests": REQUESTS}):
     from fusion import emby, tonight
+    from fusion.choices import movie_key
 from fusion.profile import SnapshotAccumulator
 
 
@@ -137,3 +138,75 @@ class TonightTests(unittest.TestCase):
         result, session = self.request([], config={**CONFIG, "play_host": "https://watch.invalid/?token=123"})
         self.assertEqual(result["reason"], "SETUP_REQUIRED")
         self.assertEqual(session.calls, [])
+
+    def test_remembered_movie_exclusion_covers_duplicate_copies_without_excluding_a_genre(self):
+        remembered = {movie_key("themoviedb:movie:1"): {"item_id": "1", "action": "hide", "revision": 1}}
+        duplicate = movie(100, ["adventure"])
+        duplicate["ProviderIds"] = {"Tmdb": "1"}
+        result, _ = self.request([page([movie(1), duplicate, movie(2, ["adventure"])])], remembered=remembered)
+        self.assertEqual([row["id"] for row in result["items"]], ["2"])
+        self.assertGreater(result["items"][0]["score"], 0)
+
+    def test_saved_fetch_is_by_id_with_user_and_root_scope_not_recent_window_or_filters(self):
+        remembered = {movie_key("themoviedb:movie:987"): {"item_id": "987", "action": "later", "revision": 1}}
+        result, session = self.request([page([{"Id": "my-library"}]), page([movie(987, editions=[source(180, "eng")])]),
+                                        Response([{"Id": "my-library"}])],
+                                       scope=SELECTED, remembered=remembered, mode="saved", max_minutes=90,
+                                       chinese_subtitles=True)
+        self.assertEqual([row["id"] for row in result["items"]], ["987"])
+        self.assertEqual(result["items"][0]["minutes"], 180)
+        query = session.calls[-2][1]["params"]
+        self.assertEqual(query["Ids"], "987")
+        self.assertEqual(query["ParentId"], "my-library")
+        self.assertEqual(query["IsPlayed"], "false")
+        self.assertEqual(query["Limit"], 12)
+        self.assertNotIn("SortBy", query)
+        self.assertTrue(session.calls[-1][0].endswith("/Items/987/Ancestors"))
+        self.assertEqual(session.calls[-1][1]["params"], {"UserId": USER})
+
+    def test_saved_ancestor_check_blocks_ids_fastpath_ignoring_parent_filter(self):
+        remembered = {movie_key("themoviedb:movie:987"): {"item_id": "987", "action": "later", "revision": 1}}
+        result, _ = self.request([page([{"Id": "my-library"}]), page([movie(987)]),
+                                  Response([{"Id": "another-library"}])],
+                                 scope=SELECTED, remembered=remembered, mode="saved")
+        self.assertFalse(result["items"][0]["available"])
+        self.assertNotIn("Fixture", json.dumps(result))
+
+    def test_saved_missing_played_or_reused_id_never_exposes_old_movie_and_keeps_clearable_placeholders(self):
+        remembered = {movie_key(f"themoviedb:movie:{i}"): {"item_id": str(i), "action": "later", "revision": i}
+                      for i in (1, 2, 3)}
+        reused = movie(3)
+        reused["ProviderIds"] = {"Tmdb": "999"}
+        result, _ = self.request([page([movie(2, played=True), reused])], remembered=remembered, mode="saved")
+        self.assertEqual([row["id"] for row in result["items"]], ["3", "2", "1"])
+        self.assertTrue(all(row["available"] is False for row in result["items"]))
+        self.assertNotIn("Fixture", json.dumps(result))
+        self.assertTrue(all("url" not in row for row in result["items"]))
+        result, _ = self.request([page([movie(999)])], remembered=remembered, mode="saved")
+        self.assertEqual(result, {"success": False, "reason": "UNAVAILABLE"})
+
+    def test_saved_and_hidden_pages_are_bounded_and_empty_still_verify_identity(self):
+        remembered = {movie_key(f"themoviedb:movie:{i}"): {"item_id": str(i), "action": "hide", "revision": i}
+                      for i in range(1, 15)}
+        result, session = self.request([page([movie(1), movie(2)])], remembered=remembered, mode="hidden", page=2)
+        self.assertEqual((result["page"], result["pages"]), (2, 2))
+        self.assertEqual([row["id"] for row in result["items"]], ["2", "1"])
+        self.assertEqual(session.calls[-1][1]["params"]["Ids"], "1,2")
+        result, session = self.request([], mode="saved")
+        self.assertEqual(result["items"], [])
+        self.assertEqual(len(session.calls), 2)
+        for options in ({"mode": "admin"}, {"page": 0}, {"page": 18}, {"page": True}):
+            result, session = self.request([], **options)
+            self.assertEqual(result["reason"], "INVALID_FILTER")
+            self.assertEqual(session.calls, [])
+
+    def test_ancestor_route_is_read_only_and_requires_the_already_verified_user(self):
+        for params in ({}, {"UserId": OTHER_USER}):
+            session = Session([])
+            with patch.object(emby.requests, "Session", return_value=session):
+                with tonight._TonightClient(CONFIG) as client:
+                    client._verified_user_id = USER
+                    with self.assertRaises(emby.EmbyReadError) as caught:
+                        client._get("/Items/1/Ancestors", params)
+                    self.assertEqual(caught.exception.code, "FORBIDDEN_ROUTE")
+            self.assertEqual(session.calls, [])

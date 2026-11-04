@@ -182,6 +182,9 @@ class EmbyReadOnlyClient:
         # The whitelist remains here even though every caller builds a fixed URL.
         allowed = path in {"/System/Info/Public", "/Users"} or re.fullmatch(
             r"/Users/[0-9a-f]{32}(?:/Views|/Items)?", path)
+        if re.fullmatch(r"/Items/[A-Za-z0-9_-]{1,128}/Ancestors", path):
+            allowed = (self._verified_user_id is not None and isinstance(params, dict)
+                       and params.get("UserId") == self._verified_user_id)
         if not allowed:
             self._fail("FORBIDDEN_ROUTE")
         remaining = self._check(stop_callback)

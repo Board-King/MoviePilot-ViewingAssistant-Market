@@ -6,6 +6,7 @@ fusion/__init__.py
 fusion/artwork.py
 fusion/candidate_ui.py
 fusion/candidates.py
+fusion/choices.py
 fusion/catalog.py
 fusion/discovery.py
 fusion/emby.py
