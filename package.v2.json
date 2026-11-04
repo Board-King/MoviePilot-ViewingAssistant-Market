@@ -1,0 +1,17 @@
+{
+  "PtSubtitleFollowup": {
+    "name": "观影助手",
+    "description": "按你的 Emby 口味，发现下一部想看的片。",
+    "version": "0.6.4",
+    "author": "Board-King",
+    "level": 1,
+    "icon": "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png",
+    "labels": "探索,订阅,字幕",
+    "system_version": "==2.15.6",
+    "v3": false,
+    "release": true,
+    "history": {
+      "v0.6.4": "观影助手换上星光电影票图标，精简市场简介，增加数据来源署名。"
+    }
+  }
+}
