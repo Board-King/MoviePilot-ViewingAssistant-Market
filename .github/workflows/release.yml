@@ -1,0 +1,33 @@
+name: Publish MoviePilot release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: public-release
+  cancel-in-progress: false
+jobs:
+  verify:
+    uses: ./.github/workflows/check.yml
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.repository == 'Board-King/MoviePilot-ViewingAssistant-Market'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build and publish a new version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(python -c "import json; print(json.load(open('package.v2.json'))['PtSubtitleFollowup']['version'])")
+          tag="PtSubtitleFollowup_v$version"
+          python tools/build.py --tag "$tag"
+          python tools/build.py --tag "$tag" --verify
+          python -c "import json; from pathlib import Path; x=json.load(open('package.v2.json'))['PtSubtitleFollowup']; Path('dist/notes.md').write_text(x['history']['v'+x['version']], encoding='utf-8')"
+          # gh refuses to create a second release for a published version. Never delete or overwrite it.
+          gh release create "$tag" "dist/ptsubtitlefollowup_v$version.zip" dist/SHA256SUMS --target "$GITHUB_SHA" --title "观影助手 $version" --notes-file dist/notes.md

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 128 128">
+  <title>观影助手 · 星光电影票</title>
+  <defs>
+    <linearGradient id="night" x2=".85" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#43326e"/><stop offset=".52" stop-color="#322854"/><stop offset="1" stop-color="#181b37"/>
+    </linearGradient>
+    <linearGradient id="paper" x2=".7" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#fff0ac"/><stop offset="1" stop-color="#ffb968"/>
+    </linearGradient>
+    <path id="ticket" d="M31 43h62a6 6 0 0 1 6 6v8a7 7 0 0 0 0 14v8a6 6 0 0 1-6 6H31a6 6 0 0 1-6-6v-8a7 7 0 0 0 0-14v-8a6 6 0 0 1 6-6z"/>
+  </defs>
+  <rect width="128" height="128" rx="27" fill="url(#night)"/>
+  <g transform="rotate(-12 64 64)">
+    <use href="#ticket" transform="translate(-1 6)" fill="#aa76a4"/>
+    <use href="#ticket" fill="url(#paper)"/>
+    <path d="M79 47v4m0 6v4m0 6v4m0 6v4" fill="none" stroke="#9b645b" stroke-width="2.8" stroke-linecap="round"/>
+    <path d="M49 54.5c0-1.4 1.5-2.3 2.8-1.6L68 62.4c1.3.7 1.3 2.5 0 3.2l-16.2 9.5c-1.3.7-2.8-.2-2.8-1.6z" fill="#372747"/>
+  </g>
+  <path d="M94 22c1.3 6.3 3.2 8.4 9.2 10-6 1.5-7.9 3.7-9.2 10-1.4-6.3-3.3-8.5-9.3-10 6-1.6 7.9-3.7 9.3-10z" fill="#fff4ca"/>
+</svg>

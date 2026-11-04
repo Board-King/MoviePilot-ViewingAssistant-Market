@@ -1,0 +1,12 @@
+/dist/
+/.local/
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.db*
+*.log
+.env
+.env.*
+*.key
+*.pem
+.venv/

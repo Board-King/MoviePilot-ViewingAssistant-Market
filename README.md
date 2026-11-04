@@ -1,4 +1,4 @@
-# 观影助手
+# <img src="icons/viewing-assistant.png" alt="" width="40" height="40" align="absmiddle"> 观影助手
 
 **按你的 Emby 口味，发现下一部想看的片。**
 
@@ -29,3 +29,5 @@ https://github.com/Board-King/MoviePilot-ViewingAssistant-Market
 This product uses the TMDB API but is not endorsed or certified by TMDB.
 
 豆瓣待播剧集来源使用 RSSHub 提供的公开窗口。作品海报和资料随来源展示。
+
+[版本下载](https://github.com/Board-King/MoviePilot-ViewingAssistant-Market/releases) · [维护与发版](MAINTAINING.md)
