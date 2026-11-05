@@ -156,13 +156,17 @@ def _candidate(fragment, sources):
     chosen = sorted(sources, key=lambda row: (-_time(row["observed_at"] or row["last_seen"]).timestamp(),
                                               row["source_id"], row["source_item_id"]))[0]
     seasons = sorted({source["season_hint"] for source in sources if source["season_hint"] is not None})
+    verified_target = len(seasons) == 1 and seasons[0] > 0 and any(
+        s["source_id"] == "tmdb_personal_tv" and s["source_item_id"] == fragment["media_id"]
+        and s["season_hint"] == seasons[0] for s in sources)
     conflict = any(any(source["metadata"][dimension] != chosen["metadata"][dimension] for dimension in DIMENSIONS)
                    for source in sources)
     return {**{key: fragment[key] for key in ("entity_key", "provider", "media_id", "media_type")},
             "title": chosen["title"], "year": chosen["year"], "release_date": chosen["release_date"],
             "metadata": chosen["metadata"], "metadata_source": {"source_id": chosen["source_id"], "source_item_id": chosen["source_item_id"]},
             "metadata_conflict": conflict, "provenance_url": chosen["provenance_url"],
-            "season_hints": seasons, "season_unknown": fragment["media_type"] == "tv" and any(source["season_hint"] is None for source in sources),
+            "season_hints": seasons, "season_unknown": fragment["media_type"] == "tv" and not verified_target
+            and any(source["season_hint"] is None for source in sources),
             "first_seen": min(source["first_seen"] for source in sources),
             "last_seen": max(source["last_seen"] for source in sources),
             "sources": sorted(sources, key=lambda row: (row["source_id"], row["source_item_id"]))}
@@ -354,7 +358,15 @@ def rank_candidates(pool, baseline=None, *, as_of):
                          "dimensions": dimensions, "groups": group_details}
         ratings = [{**rating, "source_id": source["source_id"], "source_item_id": source["source_item_id"]}
                    for source in sources for rating in source["metadata"]["ratings"]]
+        personal = next((s for s in sources if s["source_id"] == f"tmdb_personal_{candidate['media_type']}"
+                         and s["source_item_id"] == candidate["media_id"]), None)
+        personal_match = None
+        if personal and baseline is not None and candidate["provider"] == "themoviedb":
+            own_taste, own_confidence, own_dimensions, _ = _taste(personal["metadata"], baseline_index)
+            personal_match = {"source_id": personal["source_id"], "source_item_id": personal["source_item_id"],
+                              "taste_match": own_taste, "confidence": own_confidence, "dimensions": own_dimensions}
         ranked.append({**candidate, "intent_kind": intent, "state": state, "can_execute": False,
+                       "personal_match": personal_match,
                        "algorithm_version": ALGORITHM_VERSION, "evaluated_at": now.isoformat(),
                        "profile_as_of": profile_time.isoformat() if profile_time else None,
                        "library_status": "unknown", "subscription_status": "unknown",

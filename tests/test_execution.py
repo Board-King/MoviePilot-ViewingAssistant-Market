@@ -65,23 +65,27 @@ class Host:
     def compatibility(self, owner):
         return {"ready": self.compatible, "version": self.version, "host_key": self.host_key, "owner_key": self.owner_key}
 
+    @staticmethod
+    def key(identity):
+        return identity["media_id"] if identity["media_type"] == "movie" else f"tv:{identity['media_id']}:{identity['season']}"
+
     def lookup_subscription(self, identity, owner, *, indexed_only=False):
         if self.lookup_hook:
             self.lookup_hook(identity)
-        sid = self.ledger.get((owner, identity["media_id"]))
+        sid = self.ledger.get((owner, self.key(identity)))
         return {"status": "existing" if sid else "absent", "sid": sid}
 
     def lookup_library(self, identity, *, indexed_only=False):
-        return self.libs.get(identity["media_id"], "absent")
+        return self.libs.get(self.key(identity), "absent")
 
     def add(self, identity, owner, *, may_dispatch, indexed_only=False):
         if self.add_hook:
             return self.add_hook(identity, owner, may_dispatch)
         if not may_dispatch():
             return {"kind": "not_sent", "sid": None}
-        self.dispatched.append((owner, identity["media_id"]))
+        self.dispatched.append((owner, self.key(identity)))
         sid = 100 + len(self.dispatched)
-        self.ledger[(owner, identity["media_id"])] = sid
+        self.ledger[(owner, self.key(identity))] = sid
         return {"kind": "added", "sid": sid}
 
 
@@ -102,12 +106,15 @@ class ExecutionTests(unittest.TestCase):
         self.candidate_hook = None
         self.space = {"status": "ready", "fingerprint": "a" * 64, "locations_checked": 1,
                       "minimum_free_bytes": execution.SPACE_FLOOR, "available_bytes": 2 * execution.SPACE_FLOOR}
+        self.tv_space = {**self.space, "fingerprint": "b" * 64}
+        self.source_states = [SOURCE]
         self.service = self.create()
 
     def create(self):
         service = execution.ExecutionService(self.store, self.snapshot, lambda: self.host,
                                              current_config=lambda: copy.deepcopy(self.config), clock=lambda: self.now,
-                                             storage_check=lambda: copy.deepcopy(self.space))
+                                             storage_check=lambda: copy.deepcopy(self.space),
+                                             tv_storage_check=lambda: copy.deepcopy(self.tv_space))
         service.configure(self.config)
         return service
 
@@ -128,7 +135,7 @@ class ExecutionTests(unittest.TestCase):
         if self.candidate_hook:
             self.candidate_hook()
         return {"enabled": True, "profile_available": True, "sources": [
-            {"id": SOURCE, "status": "ready", "stale": False, "authentication_blocked": False}],
+            {"id": source, "status": "ready", "stale": False, "authentication_blocked": False} for source in self.source_states],
                 "candidates": copy.deepcopy(self.candidates)}
 
     def arm(self):
@@ -136,6 +143,131 @@ class ExecutionTests(unittest.TestCase):
         self.assertRegex(digest or "", "^[a-f0-9]{64}$")
         self.assertTrue(self.service.authorize(digest)["success"])
         return digest
+
+    def personal(self):
+        self.source_states = list(execution.PERSONAL_SOURCES.values())
+        self.config.update(fusion_execution_preset="personal", fusion_execution_sources=self.source_states,
+                           fusion_discovery_sources=self.source_states)
+        self.config.pop("fusion_execution_daily_limit")
+        self.service.configure(self.config)
+
+    def personal_candidate(self, kind, media_id, *, season=None, score=.8):
+        row = self.candidate(media_id)
+        source = execution.PERSONAL_SOURCES[kind]
+        row["sources"][0].update(source_id=source, season_hint=season)
+        row.update(entity_key=f"themoviedb:{kind}:{media_id}", media_type=kind,
+                   season_hints=[] if season is None else [season],
+                   metadata_source={"source_id": source, "source_item_id": media_id},
+                   personal_match={"source_id": source, "source_item_id": media_id, "taste_match": score,
+                                   "confidence": .22, "dimensions": copy.deepcopy(row["contributions"]["dimensions"])})
+        return row
+
+    def test_personal_quota_is_separate_and_rollover_preserves_old_movie_grant_accounting(self):
+        before = self.arm()
+        self.service.tick()
+        self.personal()
+        self.candidates = [self.personal_candidate("movie", str(i), score=(70+i)/100) for i in (11, 12, 13)]
+        self.candidates += [self.personal_candidate("tv", str(i), season=2) for i in (13, 14, 15)]
+        self.host.libs["tv:13:2"] = "no_known_match"
+        self.assertFalse(self.service.authorize(before)["success"])
+        self.service.tick()
+        self.assertEqual(self.host.dispatched, [("FixtureViewer", "10")])
+        self.arm()
+        self.service.tick()
+        self.assertEqual([item for _, item in self.host.dispatched], ["10", "13", "12", "tv:14:2"])
+        status = self.create().status()
+        self.assertTrue(status["armed"])
+        self.assertEqual((status["daily_limit"], status["tv_daily_limit"], status["used_movies_today"], status["used_tv_today"]), (3, 1, 3, 1))
+        self.assertEqual((status["last_scan"]["remaining_movies"], status["last_scan"]["remaining_tv"]), (0, 0))
+        tv = next(row for row in status["recent"] if row["media_type"] == "tv")
+        self.assertEqual((tv["season"], tv["match_score"], tv["match_reason"]), (2, 80, "题材相合 · Drama"))
+        self.service.tick()
+        self.assertEqual(len(self.host.dispatched), 4)
+        self.now += 120  # Shanghai midnight
+        self.service.tick()
+        self.assertEqual([item for _, item in self.host.dispatched][-2:], ["11", "tv:15:2"])
+
+    def test_personal_source_cannot_borrow_scores_or_infer_season_from_other_lists(self):
+        self.personal()
+        self.candidates = [self.personal_candidate("tv", str(n), season=1) for n in range(1, 8)]
+        self.candidates[0]["sources"][0].update(season_hint=None)
+        self.candidates[1].update(season_hints=[1, 2])
+        self.candidates[2]["sources"][0].update(season_hint=True)
+        self.candidates[3]["personal_match"]["dimensions"] = []
+        self.candidates[4]["personal_match"]["source_id"] = SOURCE
+        self.candidates[5]["sources"][0]["metadata"]["genres"] = ["Mystery"]
+        row = self.candidates[6]
+        row.update(metadata_source={"source_id": "tmdb_popular_tv", "source_item_id": "7"}, metadata_conflict=True,
+                   taste_match=.32, state="HOLD", season_unknown=True)
+        self.arm()
+        self.service.tick()
+        self.assertEqual(self.host.dispatched, [("FixtureViewer", "tv:7:1")])
+        scan = self.service.status()["last_scan"]
+        self.assertEqual((scan["season"], scan["evidence"], scan["new"]), (3, 3, 1))
+
+    def test_personal_scan_reserves_checks_for_each_type_and_handles_overlapping_ids(self):
+        self.personal()
+        self.candidates = [self.personal_candidate("movie", str(i)) for i in range(1, 9)]
+        self.candidates += [self.personal_candidate("tv", "5", season=3)]
+        self.host.libs = {str(i): "present" for i in range(1, 5)}
+        self.arm()
+        self.service.tick()
+        self.assertEqual(self.host.dispatched, [("FixtureViewer", "tv:5:3")])
+        self.service.tick()
+        self.assertEqual([item for _, item in self.host.dispatched], ["tv:5:3", "5", "6", "7"])
+        self.assertEqual(self.service.status()["used_today"], 4)
+
+    def test_disjoint_tv_grant_binds_tv_storage_and_both_limits(self):
+        legacy = self.arm()
+        self.config["fusion_execution_tv_daily_limit"] = 2
+        self.service.configure(self.config)
+        self.assertTrue(self.service.status()["armed"])
+        self.assertEqual(legacy, self.service.status()["authorization_digest"])
+        self.personal()
+        self.tv_space["status"] = "unknown"
+        self.assertEqual(self.service.preflight(self.config)["reason"], "SPACE_UNVERIFIED")
+        self.tv_space["status"] = "ready"
+        digest = self.arm()
+        self.config["fusion_execution_tv_daily_limit"] = 1
+        self.service.configure(self.config)
+        self.assertFalse(self.service.authorize(digest)["success"])
+        self.arm()
+        self.tv_space["fingerprint"] = "c" * 64
+        self.service.tick()
+        self.assertIsNone(self.store.record["grant"])
+        self.assertFalse(self.host.dispatched)
+
+    def test_personal_recent_hides_binding_changes_but_counts_owner_quota(self):
+        self.personal()
+        self.candidates = [self.personal_candidate("tv", "7", season=2)]
+        self.arm()
+        self.service.tick()
+        self.assertTrue(self.service.status()["recent"])
+        self.config["fusion_library_ids"] = "only-another-library"
+        self.service.configure(self.config)
+        changed = self.service.status()
+        self.assertFalse(changed["armed"])
+        self.assertEqual((changed["recent"], changed["used_tv_today"]), ([], 1))
+
+    def test_personal_unknown_does_not_retry_or_admit_subsequent_candidate(self):
+        self.personal()
+        self.candidates = [self.personal_candidate("tv", "17", season=1), self.personal_candidate("tv", "18", season=1)]
+        self.arm()
+        calls = []
+        def lost_response(identity, owner, may_dispatch):
+            self.assertTrue(may_dispatch())
+            calls.append((owner, self.host.key(identity)))
+            raise TimeoutError
+        self.host.add_hook = lost_response
+        self.service.tick()
+        restarted = self.create()
+        restarted.tick()
+        self.assertEqual((calls, restarted.status()["unknown_count"]), ([("FixtureViewer", "tv:17:1")], 1))
+        self.host.ledger[calls[0]] = 871
+        restarted.tick()
+        status = restarted.status()
+        self.assertEqual((status["recent"][0]["season"], status["recent"][0]["state"], status["used_tv_today"]), (1, "CONFIRMED", 1))
+        self.assertEqual(len(calls), 1)
 
     def record(self):
         return next(iter(self.store.record["intents"].values()))

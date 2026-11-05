@@ -1,6 +1,16 @@
 """Source contracts shared by scheduling and UI; no network/client imports."""
 
 SOURCE_SPECS = {
+    "tmdb_personal_movie": {
+        "id": "tmdb_personal_movie", "label": "按口味发现电影", "media_type": "movie",
+        "provider": "themoviedb", "group": "tmdb_trending", "pagination": "numbered",
+        "transport": "tmdb", "throttle_group": "tmdb_api", "personal": True,
+    },
+    "tmdb_personal_tv": {
+        "id": "tmdb_personal_tv", "label": "按口味发现剧集", "media_type": "tv",
+        "provider": "themoviedb", "group": "tmdb_trending", "pagination": "numbered",
+        "transport": "tmdb", "throttle_group": "tmdb_api", "personal": True,
+    },
     "tmdb_popular_movie": {
         "id": "tmdb_popular_movie", "label": "TMDB 热门电影", "media_type": "movie",
         "provider": "themoviedb", "group": "tmdb_trending", "pagination": "numbered",

@@ -15,7 +15,9 @@ fusion/execution_space.py
 fusion/execution_store.py
 fusion/execution_ui.py
 fusion/follow_context.py
+fusion/personal_discovery.py
 fusion/profile.py
+fusion/series_subscription.py
 fusion/service.py
 fusion/shares.py
 fusion/source_registry.py

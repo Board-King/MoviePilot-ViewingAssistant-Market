@@ -110,6 +110,7 @@ _ERRORS = {
     "FOLLOWS_EMPTY": "MoviePilot 尚无可用的关注名单。请先在 MoviePilot 中关注分享用户，再手动更新候选。",
     "INVALID_FOLLOWS": "MoviePilot 的关注名单未通过校验。请在 MoviePilot 中检查关注设置，修复后手动更新候选。",
     "CONTEXT_UNAVAILABLE": "无法读取 MoviePilot 的分享设置或关注名单。请检查 MoviePilot 的运行状态，稍后手动更新候选。",
+    "PROFILE_GENRES_REQUIRED": "等待可识别的偏好题材。请在观影偏好中核对账号和更新时间。",
     "FAILED": "本次更新未完成。请检查{source}连接，并保留错误码供排查。",
 }
 
@@ -556,7 +557,9 @@ def render_candidates(status, plugin_id="PtSubtitleFollowup"):
     if normal:
         context.append(_source_grid(normal))
     notes = [_PREVIEW_NOTE, "仅显示本轮来源窗口，尚未检查媒体库和已有订阅。"]
-    if any(_window_kind(source) == "numbered" for source in sources):
+    if any(str(source.get("id", "")).startswith("tmdb_personal_") for source in sources):
+        notes.append("个人片源按已绑定账号的偏好题材查找电影和剧集。")
+    if any(str(source.get("id", "")).startswith("tmdb_popular_") for source in sources):
         notes.append("TMDB 为热门榜的部分分页窗口。")
     if any(_window_kind(source) == "snapshot" for source in sources):
         notes.append("待播源来自第三方 RSSHub，不翻页、不推测整榜数量。")

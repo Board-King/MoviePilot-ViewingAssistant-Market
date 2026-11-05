@@ -1,8 +1,8 @@
 {
   "PtSubtitleFollowup": {
     "name": "观影助手",
-    "description": "按你的 Emby 口味，发现下一部想看的片。",
-    "version": "0.7.1",
+    "description": "按你的 Emby 口味，每天自动订阅电影和剧集。",
+    "version": "0.8.0",
     "author": "Board-King",
     "level": 1,
     "icon": "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png",
@@ -11,6 +11,7 @@
     "v3": false,
     "release": true,
     "history": {
+      "v0.8.0": "每日自动发现根据 Emby 偏好查找电影和剧集，默认每天最多 3 部电影和 1 部剧。剧集核对到季，电影和剧集各用各的名额。",
       "v0.7.1": "今晚选片可以「留到下次」或「不感兴趣」，支持撤销与恢复推荐。留下的电影集中查看，选择随个人绑定保留，无需增加设置。",
       "v0.7.0": "「今晚看什么」从我的 Emby 片库挑选最多三部未看电影，可临时按片长和已确认的中文字幕筛选，直接打开 Emby。首次绑定可按名称选择账号和媒体库。",
       "v0.6.5": "按匹配分每天选最多 3 部电影，看板显示上次选片结果和跳过原因。海报按屏宽整行翻页，口味分与 TMDB 评分同列展示，字幕补查改为逐项状态条。",

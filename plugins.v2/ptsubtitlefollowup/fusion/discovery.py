@@ -18,6 +18,7 @@ from .service import binding_key, normalize as normalize_profile
 from .catalog import SOURCE_SPECS, CatalogSourceClient
 from .follow_context import normalize_follow_context, follow_fingerprint
 from .sources import SourceReadError
+from .personal_discovery import profile_genres
 
 
 DATA_KEY = "fusion_candidates_v1"
@@ -53,6 +54,24 @@ def _utc_timestamp(value):
         return datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is not None
     except ValueError:
         return False
+
+
+def _refresh_hours(config, source_id):
+    return min(config["hours"], 12) if SOURCE_SPECS[source_id].get("personal") else config["hours"]
+
+
+def _personal_window(state, page, total_pages, pages_read, budget):
+    """Keep the front page current while a durable probe moves across the catalog."""
+    last = min(total_pages, 500)
+    probe = state.get("probe_page", 2) if page == 1 else page + 1
+    if type(probe) is not int or not 2 <= probe <= last:
+        probe = 2
+    if last <= 1 or page > last:
+        return True, 1, 2
+    if budget == 1:
+        return True, probe if page == 1 else 1, probe
+    finished = pages_read >= min(last, budget)
+    return finished, 1 if finished else probe, probe
 
 
 class CandidateService:
@@ -94,6 +113,11 @@ class CandidateService:
                 })
                 if state["status"] == "running":
                     state["status"] = "queued"
+                if (SOURCE_SPECS[source_id].get("personal") and state["status"] == "ready"
+                        and type(state.get("last_success")) in (float, int)):
+                    # Migrate a saved multi-day schedule before its next collection.
+                    latest = state["last_success"] + _refresh_hours(config, source_id) * 3600
+                    state["next_due"] = min(state.get("next_due", 0), latest)
             if not config["enabled"]:
                 self._cancel.set()
             # A host-scope change must be applied before a restored share pool
@@ -220,7 +244,7 @@ class CandidateService:
                    "INVALID_RESPONSE", "INVALID_PAGE", "RESPONSE_TOO_LARGE", "INVALID_CREDENTIAL",
                    "REDIRECT_BLOCKED", "CANCELLED", "SERVER_ERROR", "UNSUPPORTED_ENCODING", "FAILED",
                    "INVALID_CONFIG", "INVALID_PROXY", "DUPLICATE_ITEM", "NOT_FOUND", "HTTP_ERROR",
-                   "EMPTY_UNEXPECTED", "INVALID_FEED", "UNSAFE_XML", "ITEM_LIMIT"}
+                   "EMPTY_UNEXPECTED", "INVALID_FEED", "UNSAFE_XML", "ITEM_LIMIT", "PROFILE_GENRES_REQUIRED"}
         code = code if code in allowed else "FAILED"
         blocked = code in {"AUTH_REQUIRED", "FORBIDDEN", "INVALID_CREDENTIAL"}
         try:
@@ -242,6 +266,11 @@ class CandidateService:
                 candidate["sources"][target].update(
                     status="error", error_code=code, retry_until=self._clock() + delay,
                     next_due=self._clock() + delay, authentication_blocked=blocked)
+            failed = candidate["sources"][source_id]
+            if (SOURCE_SPECS[source_id].get("personal") and failed["cursor"] > 1
+                    and code in ("INVALID_PAGE", "HTTP_ERROR", "INVALID_RESPONSE", "NOT_FOUND")):
+                # A remote catalog can shrink between reading page one and the probe.
+                failed.update(cursor=1, cycle_pages=0, probe_page=2)
             try:
                 self._commit(capture, candidate)
             except Exception:
@@ -303,6 +332,11 @@ class CandidateService:
                     continue
                 try:
                     client_config = self._resolve()
+                    if SOURCE_SPECS[source_id].get("personal"):
+                        labels = profile_genres(self._profile(), config["profile_binding"])
+                        if not labels:
+                            raise SourceReadError("PROFILE_GENRES_REQUIRED", retry_after=900)
+                        client_config = {**client_config, "profile_genres": labels}
                     stop_callback = cancel.is_set
                     if source_id == FOLLOW_SOURCE:
                         self._synchronize_context()
@@ -405,7 +439,10 @@ class CandidateService:
                                for provider, identifier in identities.items())
                         or (season is not None and (kind != "tv" or type(season) is not int or not 0 <= season <= 999))):
                     raise SourceReadError("INVALID_RESPONSE")
-            elif (item.get("media_type") != spec["media_type"] or item.get("season_hint") is not None
+            elif (item.get("media_type") != spec["media_type"]
+                  or (item.get("season_hint") is not None and
+                      (source_id != "tmdb_personal_tv" or type(item["season_hint"]) is not int
+                       or not 1 <= item["season_hint"] <= 99))
                   or item.get("external_ids") != {spec["provider"]: item["source_item_id"]}):
                 raise SourceReadError("INVALID_RESPONSE")
             observed_ids.add(item["source_item_id"])
@@ -434,16 +471,22 @@ class CandidateService:
             replacement["pool"] = pool
             pages = old["cycle_pages"] + 1
             finished = next_cursor is None or pages >= capture[2]["pages"]
+            planned_cursor = 1 if finished else next_cursor
+            window_limited = batch["window_limited"] if snapshot else bool(finished and next_cursor is not None)
+            if spec.get("personal"):
+                finished, planned_cursor, probe = _personal_window(old, page, total_pages, pages, capture[2]["pages"])
+                replacement["sources"][source_id]["probe_page"] = probe
+                window_limited = finished and total_pages > pages
             replacement["sources"][source_id].update(
                 status="ready" if finished else "queued", error_code=None, retry_until=0,
                 last_success=now, last_count=len(batch["items"]), counts=counts,
-                cursor=1 if finished else next_cursor, cycle_pages=0 if finished else pages,
+                cursor=planned_cursor, cycle_pages=0 if finished else pages,
                 last_page=batch["page"], last_window_complete=finished,
-                window_limited=batch["window_limited"] if snapshot else bool(finished and next_cursor is not None),
+                window_limited=window_limited,
                 reported_total=(batch.get("reported_total") if type(batch.get("reported_total")) is int
                                 and 0 <= batch["reported_total"] <= 1_000_000_000 else None),
                 observed_window=observed_window,
-                next_due=now + (capture[2]["hours"] * 3600 if finished else 60),
+                next_due=now + (_refresh_hours(capture[2], source_id) * 3600 if finished else 60),
                 authentication_blocked=False,
             )
             return self._commit(capture, replacement)
@@ -472,7 +515,7 @@ class CandidateService:
             source.update(id=source_id, label=SOURCE_SPECS[source_id]["label"],
                           cooldown_remaining=max(0, int(source.get("retry_until", 0) - self._clock() + .999)))
             source["stale"] = bool(source.get("last_success") and (
-                source.get("status") == "error" or self._clock() - source["last_success"] > config["hours"] * 7200))
+                source.get("status") == "error" or self._clock() - source["last_success"] > _refresh_hours(config, source_id) * 7200))
             sources.append(source)
         state = ("disabled" if not config["enabled"] else "paused" if paused else "running" if running
                  else "error" if any(s.get("status") == "error" for s in sources)

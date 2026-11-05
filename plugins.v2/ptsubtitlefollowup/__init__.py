@@ -113,9 +113,9 @@ def mapped_target(storage, destination, mappings, local_roots):
 
 class PtSubtitleFollowup(_PluginBase):
     plugin_name = "观影助手"
-    plugin_desc = "按你的 Emby 口味，发现下一部想看的片。"
+    plugin_desc = "按你的 Emby 口味，每天自动订阅电影和剧集。"
     plugin_icon = "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png"
-    plugin_version = "0.7.1"
+    plugin_version = "0.8.0"
     plugin_author = "Board-King"
     author_url = "https://github.com/Board-King"
     plugin_url = "https://github.com/Board-King/MoviePilot-ViewingAssistant-Market"
@@ -142,7 +142,9 @@ class PtSubtitleFollowup(_PluginBase):
                 ExecutionStore(lambda: self.get_data_path() / "automatic-subscriptions"),
                 self._candidates.status, lambda: HostSubscriptionAdapter(self._all_media_servers),
                 current_config=self.get_config,
-                storage_check=lambda: host_movie_download_space(storage_verified=True, systemconfig=self.systemconfig))
+                storage_check=lambda: host_movie_download_space(storage_verified=True, systemconfig=self.systemconfig),
+                tv_storage_check=lambda: host_movie_download_space(storage_verified=True, systemconfig=self.systemconfig,
+                                                                   media_type="tv"))
 
     def init_plugin(self, config=None):
         config = config or {}
@@ -755,5 +757,4 @@ class PtSubtitleFollowup(_PluginBase):
             if profile_status.get("binding_verified") and profile_status.get("enabled"):
                 execution_status["profile_name"] = profile_status.get("user_name")
             execution_page = render_execution(execution_status, self.__class__.__name__)
-        activity = _node("div", props={"class": "va-activity-grid"}, content=[*execution_page, subtitles])
-        return [*overview, activity]
+        return [*execution_page, *overview, subtitles]

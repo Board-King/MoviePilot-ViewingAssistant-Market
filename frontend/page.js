@@ -14,9 +14,9 @@ function renderNode(Vue, node, ctx = {}) {
   delete props.model
   delete props.show
   if (condition) {
-    const eq = /^\{\{\s*(\w+)\s*===\s*'([^']*)'\s*\}\}$/.exec(condition)
+    const eq = /^\{\{\s*(\w+)\s*(===|!==)\s*'([^']*)'\s*\}\}$/.exec(condition)
     const flag = /^\{\{\s*(\w+)\s*\}\}$/.exec(condition)
-    if (!(eq ? ctx.model?.[eq[1]] === eq[2] : flag && ctx.model?.[flag[1]] === true)) return null
+    if (eq ? (ctx.model?.[eq[1]] === eq[3]) !== (eq[2] === '===') : !flag || ctx.model?.[flag[1]] !== true) return null
   }
   if (key === 'fusion_user_id' && ctx.renderAccountField) return ctx.renderAccountField()
   if (key === 'fusion_library_ids' && ctx.libraryPicker) {
@@ -53,12 +53,13 @@ function makePage(Vue, pluginId) {
       const rows = Vue.ref(null), error = Vue.ref(''), info = Vue.ref(''), busy = Vue.ref(false)
       const scroller = Vue.ref(null)
       const resume = vaTakeHandoff('page')
+      const showTonight = Vue.ref(resume?.target === 'tonight')
       let selection = resume?.selection || {kind:'all',period:'all',page:1}
       let restoreScroll = resume?.top ?? null
       function settings(target) {
         if (!props.show_switch || busy.value) return
         vaLeaveBoard({selection:{...selection},top:scroller.value?.scrollTop || 0,
-          target:['ranked','tonight'].includes(target) ? target : undefined})
+          target:['ranked','tonight','personal'].includes(target) ? target : undefined})
         emit('switch')
       }
       function shelfReady(newSelection) {
@@ -121,12 +122,16 @@ function makePage(Vue, pluginId) {
           vaHeader(Vue,'观影助手',()=>emit('close'),false),
           h('div',{ref:scroller,class:'va-scroll pa-4'}, [
             !rows.value && !error.value ? h('div',{role:'status',class:'py-4'},'正在读取看板…') : null,
-            rows.value ? h(Tonight,{key:'tonight',api:props.api,pluginId,initial:rows.value,
-              onSettings:props.show_switch ? settings : undefined}) : null,
             ...(rows.value || []).map(row => row.props?.['data-va-shelf']
               ? h(Shelf,{key:'shelf', initial:row,api:props.api,pluginId,resume:resume?.selection,onReady:shelfReady})
               : renderNode(Vue,row,{pluginId, SubtitleRail, busy:busy.value,toolbarPrimary:true,onAction:action,
                 onSwitch:props.show_switch ? settings : undefined})),
+            rows.value ? h('details',{class:'va-more mt-3',open:showTonight.value,
+              onToggle:event=>{showTonight.value=event.currentTarget.open}},[
+              h('summary','今晚看什么'),
+              showTonight.value ? h(Tonight,{api:props.api,pluginId,initial:rows.value,
+                onSettings:props.show_switch ? settings : undefined}) : null,
+            ]) : null,
           ]),
           error.value ? h('div',{role:'alert',class:'d-flex align-center ga-2 text-error px-4 py-1'},[
             error.value, btn('刷新状态',refresh,{disabled:busy.value})]) : null,

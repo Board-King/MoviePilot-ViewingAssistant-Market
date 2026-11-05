@@ -19,6 +19,10 @@ from urllib.parse import urlsplit
 
 import requests
 
+from .personal_discovery import genre_matches, rotating_genres
+from .series_subscription import latest_aired_season
+from .source_registry import SOURCE_SPECS as REGISTRY
+
 
 BASE_URL = "https://api.themoviedb.org"
 MAX_PAGES_PER_CYCLE = 3
@@ -29,6 +33,8 @@ MAX_JSON_NODES = 6000
 MAX_JSON_DEPTH = 12
 MAX_RETRY_AFTER = 3600
 SOURCE_SPECS = {
+    **{sid: {**spec, "settings": {"sort_by": "popularity.desc"}}
+       for sid, spec in REGISTRY.items() if spec.get("personal")},
     "tmdb_popular_movie": {
         "id": "tmdb_popular_movie", "label": "TMDB 热门电影", "media_type": "movie",
         "group": "tmdb_trending", "settings": {"sort_by": "popularity.desc"},
@@ -43,7 +49,8 @@ SOURCE_SPECS = {
 }
 _PATHS = frozenset({"/3/discover/movie", "/3/discover/tv",
                     "/3/genre/movie/list", "/3/genre/tv/list"})
-_PARAMS = frozenset({"language", "page", "sort_by", "with_original_language"})
+_PARAMS = frozenset({"language", "page", "sort_by", "with_original_language", "with_genres",
+                     "primary_release_date.lte", "first_air_date.lte"})
 
 
 class SourceReadError(RuntimeError):
@@ -128,6 +135,7 @@ class TmdbSourceClient:
         self._deadline = time.monotonic() + _bound(deadline_seconds, 1, 120)
         self._proxies = _proxy_config(config.get("proxies"))
         self._key = key
+        self._profile_genres = config.get("profile_genres") or []
         self._session = requests.Session()
         self._session.trust_env = False
         self._session.headers.update({"Accept": "application/json", "Accept-Encoding": "identity"})
@@ -195,7 +203,7 @@ class TmdbSourceClient:
             self._fail("INVALID_ENDPOINT")
         return self._read_json(path, params)
 
-    def _read_json(self, path, params):
+    def _read_json(self, path, params, *, missing_ok=False):
         remaining = self._check()
         query = {**params, "api_key": self._key}
         try:
@@ -212,6 +220,8 @@ class TmdbSourceClient:
                 if status == 429:
                     self._fail("RATE_LIMITED", self._retry_after(response.headers.get("Retry-After")))
                 if status == 404:
+                    if missing_ok:
+                        return {}
                     self._fail("NOT_FOUND")
                 if status >= 500:
                     self._fail("SERVER_ERROR")
@@ -273,9 +283,10 @@ class TmdbSourceClient:
                 self._fail("INVALID_RESPONSE")
         self._check()
 
-    def _genre_map(self, kind):
-        if kind not in self._genres:
-            payload = self._get(f"/3/genre/{kind}/list", {"language": "zh-CN"})
+    def _genre_map(self, kind, language="zh-CN"):
+        cache_key = (kind, language)
+        if cache_key not in self._genres:
+            payload = self._get(f"/3/genre/{kind}/list", {"language": language})
             rows = payload.get("genres")
             if not isinstance(rows, list) or len(rows) > 100:
                 self._fail("INVALID_RESPONSE")
@@ -287,8 +298,8 @@ class TmdbSourceClient:
                 if label is None or row["id"] in result:
                     self._fail("INVALID_RESPONSE")
                 result[row["id"]] = label
-            self._genres[kind] = result
-        return self._genres[kind]
+            self._genres[cache_key] = result
+        return self._genres[cache_key]
 
     def _item(self, row, spec, genre_map, observed_at):
         if not isinstance(row, dict) or not _positive_int(row.get("id")):
@@ -321,7 +332,7 @@ class TmdbSourceClient:
         identity = str(row["id"])
         return {
             "source_id": spec["id"], "source_item_id": identity,
-            "source_group": "tmdb_trending", "intent_kind": "discovery", "media_type": kind,
+            "source_group": spec["group"], "intent_kind": "discovery", "media_type": kind,
             "external_ids": {"themoviedb": identity}, "season_hint": None,
             "title": title, "year": year,
             "metadata": {"genres": genres, "languages": languages,
@@ -348,6 +359,22 @@ class TmdbSourceClient:
         spec = SOURCE_SPECS[source_id]
         kind = spec["media_type"]
         params = {"language": "zh-CN", "page": cursor, **spec["settings"]}
+        today = datetime.now(timezone.utc).date()
+        matches = {}
+        if spec.get("personal"):
+            if not self._profile_genres:
+                self._fail("PROFILE_GENRES_REQUIRED", 900)
+            localized = self._genre_map(kind)
+            # Match imported English-language Emby genres to the same TMDB
+            # IDs without sending titles, user IDs or genre strings upstream.
+            english = self._genre_map(kind, "en-US") if any(
+                label.isascii() for label in self._profile_genres) else {}
+            matches = genre_matches(self._profile_genres, localized, english)
+            genre_ids = rotating_genres(matches, today)
+            if not genre_ids:
+                self._fail("PROFILE_GENRES_REQUIRED", 3600)
+            params["with_genres"] = "|".join(map(str, genre_ids))
+            params["primary_release_date.lte" if kind == "movie" else "first_air_date.lte"] = today.isoformat()
         payload = self._get(f"/3/discover/{kind}", params)
         rows, page, total_pages = payload.get("results"), payload.get("page"), payload.get("total_pages")
         if (not isinstance(rows, list) or len(rows) > MAX_PAGE_ITEMS
@@ -362,7 +389,7 @@ class TmdbSourceClient:
         if not rows and payload.get("total_results", 0) != 0 and cursor == 1:
             self._fail("INVALID_RESPONSE")
         # Empty results do not require an additional genre lookup.
-        genre_map = self._genre_map(kind) if rows else {}
+        genre_map = {**self._genre_map(kind), **matches} if rows else {}
         observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         items, seen = [], set()
         for row in rows:
@@ -372,6 +399,15 @@ class TmdbSourceClient:
                 self._fail("DUPLICATE_ITEM")
             seen.add(item["source_item_id"])
             items.append(item)
+        if source_id == "tmdb_personal_tv" and items:
+            # Cover different series on successive days without issuing up to
+            # twenty detail requests per page on the user's NAS.
+            sample_size = min(5, len(items), limit)
+            offset = today.toordinal() * 5 % min(len(items), limit)
+            for index in range(sample_size):
+                item = items[(offset + index) % min(len(items), limit)]
+                detail = self._read_json(f"/3/tv/{item['source_item_id']}", {"language": "zh-CN"}, missing_ok=True)
+                item["season_hint"] = latest_aired_season(detail, item["source_item_id"], today=today)
         self._check()
         return {"source_id": source_id, "items": items[:limit], "page": cursor,
                 "total_pages": total_pages,

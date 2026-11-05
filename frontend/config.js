@@ -23,26 +23,51 @@ function vaBindingIssues(draft) {
   return issues
 }
 
+const vaPersonalFeeds = ['tmdb_personal_movie', 'tmdb_personal_tv']
+const vaMovieFeed = 'tmdb_popular_movie'
+
+function vaSelectStrategy(draft, preset) {
+  const wasPersonal = draft.fusion_execution_preset === 'personal'
+  draft.fusion_execution_preset = preset
+  if (wasPersonal === (preset === 'personal')) return
+  const feeds = preset === 'personal' ? vaPersonalFeeds : [vaMovieFeed]
+  const previous = Array.isArray(draft.fusion_discovery_sources) ? draft.fusion_discovery_sources : []
+  draft.fusion_discovery_sources = [...new Set([...previous, ...feeds])]
+  draft.fusion_execution_sources = [...feeds]
+  draft.fusion_discovery_enabled = true
+  draft.fusion_execution_legacy_isolated = false
+  draft.fusion_execution_storage_verified = false
+  if (preset === 'personal') {
+    draft.fusion_execution_daily_limit = 3
+    draft.fusion_execution_tv_daily_limit = 1
+  }
+}
+
 function draftIssues(draft) {
   if (draft.fusion_execution_enabled !== true) return []
   const issues = vaBindingIssues(draft)
   const need = (ok, key, text) => { if (!ok) issues.push({ key, text }) }
-  const source = 'tmdb_popular_movie'
+  const preset = draft.fusion_execution_preset
+  const personal = preset === 'personal'
+  const feeds = personal ? vaPersonalFeeds : [vaMovieFeed]
   const plain = (value, limit) => typeof value === 'string' && value.trim() === value &&
     value.length > 0 && Array.from(value).length <= limit && !/[\p{C}\p{Z}]/u.test(value.replace(/ /g, ''))
   need(draft.fusion_discovery_enabled === true, 'fusion_discovery_enabled', '打开候选更新')
-  need(Array.isArray(draft.fusion_discovery_sources) && draft.fusion_discovery_sources.includes(source),
-    'fusion_discovery_sources', '候选来源加入 TMDB 热门电影')
+  need(Array.isArray(draft.fusion_discovery_sources) && feeds.every(x => draft.fusion_discovery_sources.includes(x)),
+    'fusion_discovery_sources', personal ? '候选来源加入个性化电影和剧集' : '候选来源加入 TMDB 热门电影')
   need(plain(draft.fusion_execution_owner, 128), 'fusion_execution_owner', '填写 MoviePilot 订阅用户名')
   const sources = draft.fusion_execution_sources
-  need(Array.isArray(sources) && sources.length === 1 && sources[0] === source,
-    'fusion_execution_sources', '选择自动订阅来源')
-  const preset = draft.fusion_execution_preset
-  need(['ranked', 'conservative', 'balanced'].includes(preset), 'fusion_execution_preset', '选择订阅方式')
+  need(Array.isArray(sources) && sources.length === feeds.length && feeds.every(x => sources.includes(x)),
+    personal ? 'fusion_execution_preset' : 'fusion_execution_sources',
+    personal ? '重新选择按口味发现电影和剧集' : '选择自动订阅来源')
+  need(['personal', 'ranked', 'conservative', 'balanced'].includes(preset), 'fusion_execution_preset', '选择订阅方式')
   const daily = draft.fusion_execution_daily_limit
-  const max = preset === 'ranked' ? 3 : 5
+  const max = personal || preset === 'ranked' ? 3 : 5
   need(['string', 'number'].includes(typeof daily) && /^[1-5]$/.test(String(daily)) && Number(daily) <= max,
-    'fusion_execution_daily_limit', '每日上限需为 1–' + max + ' 部')
+    'fusion_execution_daily_limit', '电影每日上限需为 1–' + max + ' 部')
+  const tv = draft.fusion_execution_tv_daily_limit
+  if (personal) need(['string', 'number'].includes(typeof tv) && /^[1-3]$/.test(String(tv)),
+    'fusion_execution_tv_daily_limit', '剧集每日上限需为 1–3 部')
   need(draft.fusion_execution_legacy_isolated === true, 'fusion_execution_legacy_isolated', '确认同来源旧订阅已停用')
   need(draft.fusion_execution_storage_verified === true, 'fusion_execution_storage_verified', '确认下载目录的存储映射')
   return issues
@@ -51,8 +76,10 @@ function draftIssues(draft) {
 // Only a single scoped action returned by the current review may leave the read-only card.
 function vaReviewScope(nodes, path) {
   let selected = null
+  let verifyBinding = false
   function pick(node) {
     if (!node || typeof node !== 'object') return node
+    if (node.props?.['data-va-verify-binding'] === true) verifyBinding = true
     if (node.props?.['data-va-execution-review-action'] && Array.isArray(node.content)) {
       const buttons = node.content.filter(n => n?.component === 'VBtn')
       const b = buttons[0], event = b?.events?.click
@@ -67,7 +94,7 @@ function vaReviewScope(nodes, path) {
     return Array.isArray(node.content) ? {...node,content:node.content.map(pick).filter(Boolean)} : node
   }
   const scope = Array.isArray(nodes) ? nodes.map(pick).filter(Boolean) : []
-  return {scope,selected}
+  return {scope,selected,verifyBinding}
 }
 
 function makeConfig(Vue, renderNode, Support, pluginId) {
@@ -77,8 +104,8 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
   const resultText = {
     INCOMPATIBLE: ['fusion_execution_owner', '未能核实这个订阅用户或当前 MoviePilot 版本。请检查用户名与宿主版本。'],
     SERVER_UNAVAILABLE: ['fusion_server_ref', '所选 Emby 连接已不可用，请重新选择。'],
-    SPACE_LOW: ['fusion_execution_storage_verified', '电影下载目录可用空间低于 100 GiB。'],
-    SPACE_UNVERIFIED: ['fusion_execution_storage_verified', 'MoviePilot 无法核实电影下载路径与存储，请检查目录和下载器配置。'],
+    SPACE_LOW: ['fusion_execution_storage_verified', '下载目录可用空间低于 100 GiB。'],
+    SPACE_UNVERIFIED: ['fusion_execution_storage_verified', 'MoviePilot 无法核实下载路径与存储，请检查目录和下载器配置。'],
   }
   const validId = typeof pluginId === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,127}$/.test(pluginId)
   return {
@@ -86,6 +113,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
     setup(props, { emit }) {
       const boardBookmark = vaTakeHandoff('config')
       let openRankedDraft = boardBookmark?.target === 'ranked'
+      let openPersonalDraft = boardBookmark?.target === 'personal'
       const tonightSetup = boardBookmark?.target === 'tonight'
       const draft = ref({}), form = ref([]), loaded = ref(false), busy = ref(false)
       const message = ref(''), serverIssue = ref(null), review = ref(null), saved = ref(false), conflict = ref(false)
@@ -113,7 +141,8 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
           draft.value.fusion_library_mode = 'unselected'
           draft.value.fusion_library_ids = ''
         }
-        draft.value[key] = value
+        if (key === 'fusion_execution_preset') vaSelectStrategy(draft.value, value)
+        else draft.value[key] = value
         serverIssue.value = null
         message.value = ''
       }
@@ -192,9 +221,14 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
           draft.value = copy(response.model)
           original = JSON.stringify(draft.value)
           loaded.value = true
-          if (openRankedDraft) {
+          if (openPersonalDraft) {
+            openPersonalDraft = false
+            vaSelectStrategy(draft.value, 'personal')
+            draft.value.fusion_execution_enabled = true
+            nextTick(() => focusField(issues.value[0]?.key || 'fusion_execution_preset'))
+          } else if (openRankedDraft) {
             openRankedDraft = false
-            draft.value.fusion_execution_preset = 'ranked'
+            vaSelectStrategy(draft.value, 'ranked')
             if (Number(draft.value.fusion_execution_daily_limit) > 3) draft.value.fusion_execution_daily_limit = 3
             nextTick(() => focusField('fusion_execution_preset'))
           }
@@ -226,6 +260,16 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         message.value = ''
         try { await fetchReview() }
         catch { if (alive) message.value = '设置已保存，暂时无法读取授权范围。' }
+        finally { if (alive) busy.value = false }
+      }
+      async function verifySavedBinding() {
+        if (busy.value || !saved.value || !presented.value.verifyBinding) return
+        busy.value = true; message.value = ''
+        try {
+          const result = await props.api.post(path + '/fusion/validate', {})
+          if (result?.success !== true) throw Error()
+          if (alive) await fetchReview()
+        } catch { if (alive) message.value = '无法验证 Emby 账号，请检查绑定或重试。' }
         finally { if (alive) busy.value = false }
       }
       async function persistDraft(snapshot) {
@@ -273,7 +317,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
           const allowed = ['fusion_enabled', 'fusion_server_ref', 'fusion_user_id', 'fusion_library_mode',
             'fusion_library_ids', 'fusion_discovery_enabled', 'fusion_discovery_sources']
           const params = Object.fromEntries(Object.entries(snapshot).filter(([key]) =>
-            allowed.includes(key) || ['enabled', 'owner', 'sources', 'daily_limit', 'preset', 'legacy_isolated',
+            allowed.includes(key) || ['enabled', 'owner', 'sources', 'daily_limit', 'tv_daily_limit', 'preset', 'legacy_isolated',
               'storage_verified'].some(name => key === 'fusion_execution_' + name)))
           const checked = await props.api.post(path + '/fusion/execution/preflight', params)
           if (!alive) return
@@ -314,7 +358,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
       const fieldProps = key => {
         const issue = issues.value.find(item => item.key === key)
         return { disabled: busy.value,
-          ...(key === 'fusion_execution_daily_limit' ? {max:draft.value.fusion_execution_preset === 'ranked' ? 3 : 5} : {}),
+          ...(key === 'fusion_execution_daily_limit' ? {max:['personal','ranked'].includes(draft.value.fusion_execution_preset) ? 3 : 5} : {}),
           ...(issue ? { 'error-messages': issue.text } : {}) }
       }
       function switchPage() {
@@ -336,6 +380,8 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
             (personalSetup.value && !!nextBinding.value)})]
         const intent = presented.value.selected
         const actions = [textButton(intent?.grant?'暂不授权':'完成',close,{key:'review-done',disabled:busy.value})]
+        if (presented.value.verifyBinding) actions.push(textButton('验证 Emby 账号',verifySavedBinding,
+          {key:'verify-binding',color:'primary',variant:'flat',loading:busy.value,disabled:busy.value}))
         if (intent) actions.push(textButton(intent.grant?'确认范围并授权':'撤销自动订阅授权',e=>act(intent,e),{
           key:intent.grant?'review-grant':'review-revoke',color:intent.grant?'primary':'error',variant:intent.grant?'flat':'tonal',
           disabled:busy.value || (intent.grant && !deliberate.value),'aria-describedby':'va-scope-effect',

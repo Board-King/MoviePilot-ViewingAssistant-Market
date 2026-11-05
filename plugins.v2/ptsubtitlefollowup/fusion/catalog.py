@@ -20,6 +20,7 @@ class CatalogSourceClient:
         if not isinstance(config, Mapping):
             raise SourceReadError("INVALID_CONFIG")
         self._config = {"api_key": config.get("api_key"), "proxies": config.get("proxies")}
+        self._profile_genres = config.get("profile_genres", [])
         self._follow_config = {key: config[key] for key in ("context_valid", "sharing_enabled", "followed_uids")
                                if key in config}
         self._stop_callback, self._closed, self._client = stop_callback, False, None
@@ -60,6 +61,8 @@ class CatalogSourceClient:
         if spec["transport"] == "tmdb":
             factory = TmdbSourceClient
             config = {"api_key": self._config["api_key"], "proxies": self._config["proxies"]}
+            if spec.get("personal"):
+                config["profile_genres"] = self._profile_genres
         elif spec["transport"] == "upcoming_rss":
             factory = UpcomingSourceClient
             config = {"proxies": self._config["proxies"]}

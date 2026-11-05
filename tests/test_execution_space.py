@@ -58,6 +58,20 @@ class SpaceTests(unittest.TestCase):
         self.downloaders[0]["config"]["host"] = "http://alternate-downloader.invalid:8080"
         self.assertNotEqual(self.check()["fingerprint"], original)
 
+    def test_tv_uses_tv_directories_own_template_and_type_subfolder(self):
+        self.dirs.insert(0, {"media_type": "电视剧", "media_category": "Drama", "storage": "local", "download_path": "/media/tv"})
+        self.dirs[2]["download_type_folder"] = True
+        self.volumes["/media/tv"] = {"mount": "a" * 64, "available_bytes": MIN+17}
+        for kind in ("电影", "电视剧"):
+            self.volumes[f"/array/general/{kind}"] = {"mount": "b" * 64, "available_bytes": MIN}
+        def tv(template=None):
+            return space.check_movie_download_space(self.dirs, self.downloaders, template,
+                                                    storage_verified=True, probe=self.probe, media_type="tv")
+        self.assertEqual(tv()["status"], "ready")
+        self.assertEqual(set(self.probed), {"/array/general/电视剧", "/media/tv"})
+        self.assertEqual(tv({"save_path": "/media/movies"})["status"], "unknown")
+        self.assertEqual(tv({"save_path": "/media/tv"})["status"], "ready")
+
     def test_explicit_template_must_stay_inside_known_movie_roots(self):
         self.assertEqual(self.check({"save_path": "local:/media/movies/sub", "downloader": "Primary"})["status"], "ready")
         self.assertEqual(self.probed, ["/media/movies/sub"])

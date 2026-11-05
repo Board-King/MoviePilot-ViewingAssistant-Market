@@ -34,6 +34,14 @@ const vaShellStyle = `
 .va-quota-meter{display:flex;gap:3px;margin-left:4px}
 .va-quota-meter>span{display:block;width:6px;height:14px;border-radius:3px;background:rgba(var(--v-theme-on-surface),.13)}
 .va-quota-meter>.is-used{background:rgb(var(--v-theme-primary))}
+.va-daily-budgets{display:flex;flex-wrap:wrap;gap:6px 14px;margin-inline-start:auto}
+.va-daily-budgets>.va-ex-quota{margin:0}
+.va-picks{list-style:none;padding:0;margin:4px 0 12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,17rem),1fr));column-gap:20px}
+.va-pick{min-width:0;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-top:1px solid rgba(var(--v-theme-on-surface),.1)}
+.va-pick>div{min-width:0;overflow-wrap:anywhere}
+.va-pick strong{font-size:.875rem;font-weight:600}
+.va-pick-state{white-space:nowrap;font-size:.75rem;color:rgba(var(--v-theme-on-surface),.72)}
+.va-pick-state[data-confirmed=true]{color:rgb(var(--v-theme-success))}
 .va-sub-legend,.va-sub-track,.va-sub-pages{display:flex;align-items:center;gap:6px}
 .va-sub-legend{flex-wrap:wrap}
 .va-subtitles [data-kind=saved]{--va-ink:var(--v-theme-success)}

@@ -17,7 +17,7 @@ const full = {
 }
 async function open(config, failAt, directory) {
   const calls = [], emitted = []
-  let persisted = structuredClone(config), mounted, updateField, armed = false
+  let persisted = structuredClone(config), mounted, updateField, armed = false, verified = false
   const api = {
     async get(url, options) {
       calls.push(['GET', url])
@@ -25,6 +25,7 @@ async function open(config, failAt, directory) {
       if (url === base + '/fusion/binding/users') return directory(options.params.server_ref)
       assert.equal(url, scope + 'review')
       if (failAt === 'review') throw Error()
+      if (failAt === 'binding' && !verified) return {page:[{component:'div',props:{'data-va-verify-binding':true}}]}
       const grant = {method:'POST',api:scope+'authorize',params:{expected_digest:failAt==='digest'?'bad':'a'.repeat(64)}}
       return {page:[{component:'div',content:[{component:'div',props:{'data-va-execution-review-action':true},content:[
         {component:'span',text:'授权后可能搜索和下载。'},
@@ -36,6 +37,7 @@ async function open(config, failAt, directory) {
       if (url === scope + 'preflight' && failAt === 'check') return { success: false, reason: 'INCOMPATIBLE' }
       if (url === scope+'authorize') armed = true
       if (url === scope+'revoke') armed = false
+      if (url === base+'/fusion/validate') verified = true
       return { success: true }
     },
     async put(url, body) {
@@ -206,6 +208,51 @@ test('saved settings get a separately reviewable digest, and only the explicit g
   assert.equal(ui.calls.length,7)
   assert.ok(ui.button('撤销自动订阅授权'))
   assert.deepEqual(ui.emitted.map(e=>e[0]), ['layout'])
+})
+
+test('personal setup proposes separate 3 + 1 budgets and keeps the previous movie grant outside the new draft', async () => {
+  const sources = ['tmdb_personal_movie','tmdb_personal_tv']
+  const before = {...full, fusion_discovery_sources:['tmdb_popular_movie','tmdb_popular_tv']}
+  vaLeaveBoard({target:'personal'})
+  const ui = await open(before)
+  assert.deepEqual(ui.calls,[['GET','plugin/form/'+id]])
+  assert.equal(ui.button('保存').props.disabled,true)
+  ui.edit('fusion_execution_legacy_isolated',true)
+  ui.edit('fusion_execution_storage_verified',true)
+  assert.equal(ui.button('保存').props.disabled,false)
+  for (const field of ['fusion_execution_daily_limit','fusion_execution_tv_daily_limit']) {
+    ui.edit(field,4)
+    assert.equal(ui.button('保存').props.disabled,true)
+    ui.edit(field, field === 'fusion_execution_daily_limit' ? 3 : 1)
+  }
+  await ui.button('保存').props.onClick()
+  const check = ui.calls.find(call=>call[1] === scope+'preflight')[2]
+  const saved = ui.calls.find(call=>call[0] === 'PUT')[2]
+  for (const model of [check,saved]) {
+    assert.equal(model.fusion_execution_preset,'personal')
+    assert.equal(model.fusion_execution_daily_limit,3)
+    assert.equal(model.fusion_execution_tv_daily_limit,1)
+    assert.deepEqual(Array.from(model.fusion_execution_sources),sources)
+    assert.deepEqual(Array.from(model.fusion_discovery_sources),[...before.fusion_discovery_sources,...sources])
+    assert.equal(model.fusion_user_id,full.fusion_user_id)
+  }
+  assert.equal(saved.unrelated_option,full.unrelated_option)
+  assert.ok(ui.button('确认范围并授权'))
+  assert.ok(!ui.calls.some(call=>call[1] === scope+'authorize'))
+})
+
+test('an unverified personal binding can be verified after saving in the same dialog', async () => {
+  const ui=await open({...full,fusion_execution_enabled:false},'binding')
+  ui.edit('fusion_execution_preset','personal')
+  ui.edit('fusion_execution_enabled',true)
+  ui.edit('fusion_execution_legacy_isolated',true)
+  ui.edit('fusion_execution_storage_verified',true)
+  await ui.button('保存').props.onClick()
+  assert.equal(ui.button('确认范围并授权'),undefined)
+  await ui.button('验证 Emby 账号').props.onClick()
+  assert.deepEqual(ui.calls.slice(-2).map(call=>call.slice(0,2)),[['POST',base+'/fusion/validate'],['GET',scope+'review']])
+  assert.ok(ui.button('确认范围并授权'))
+  assert.ok(!ui.calls.some(call=>call[1] === scope+'authorize'))
 })
 
 test('review can be declined or edited; blocked and unbound scopes have no footer grant', async () => {

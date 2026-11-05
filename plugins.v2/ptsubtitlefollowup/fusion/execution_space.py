@@ -1,4 +1,4 @@
-"""Bounded, read-only disk headroom check for MP v2.15.6 ordinary movies.
+"""Bounded, read-only disk headroom checks for MP v2.15.6 movie and TV downloads.
 
 DirectoryHelper.get_dir and DownloadChain._resolve_media_download_dir select
 the configured root. _DownloaderBase.normalize_path maps full path prefixes.
@@ -127,12 +127,12 @@ def _downloader(row, roots):
             parsed.path, settings.get("protocol"), effective]
 
 
-def _possible_movie_rows(rows):
+def _possible_rows(rows, label):
     """First match per category, plus the first wildcard for every other one."""
     result, categories = [], set()
     for row in rows:
         media_type, category = row.get("media_type"), row.get("media_category")
-        if media_type not in (None, "", "电影"):
+        if media_type not in (None, "", label):
             continue
         # v2.15.6 checks a blank media_type before its category conditions.
         if not media_type or not category:
@@ -146,7 +146,7 @@ def _possible_movie_rows(rows):
     return result, False
 
 
-def _destinations(directories, template):
+def _destinations(directories, template, label):
     if not isinstance(directories, list) or not 1 <= len(directories) <= 100:
         raise ValueError
     if not all(isinstance(row, dict) for row in directories):
@@ -162,7 +162,7 @@ def _destinations(directories, template):
         # of get_dir's implicit selection. Only exact roots inherit classification.
         containing = []
         for row in directories:
-            if row.get("storage") != "local" or row.get("media_type") not in (None, "", "电影") or not row.get("download_path"):
+            if row.get("storage") != "local" or row.get("media_type") not in (None, "", label) or not row.get("download_path"):
                 continue
             base = _path(row["download_path"])
             if forced.is_relative_to(base):
@@ -173,13 +173,13 @@ def _destinations(directories, template):
         # get_download_dir_by_save_path (unlike get_dir) scans by priority.
         if any(type(row.get("priority", 0)) is not int for row in exact):
             raise ValueError
-        rows, covers_all = _possible_movie_rows(sorted(exact, key=lambda row: row.get("priority", 0)))
+        rows, covers_all = _possible_rows(sorted(exact, key=lambda row: row.get("priority", 0)), label)
         if not covers_all:
             roots.add(forced)
     else:
         # The native call is get_dir(media, include_unsorted=True). An unmonitored
         # movie directory remains eligible. Stored order, not priority, wins.
-        rows, _ = _possible_movie_rows(directories)
+        rows, _ = _possible_rows(directories, label)
     for row in rows:
         if row.get("storage") != "local":
             raise ValueError
@@ -192,14 +192,14 @@ def _destinations(directories, template):
             # to guess which directory, symlink or filesystem it may resolve to.
             raise ValueError
         if row.get("download_type_folder") and not row.get("media_type"):
-            base /= "电影"
+            base /= label
         roots.add(base)
     if not 1 <= len(roots) <= 32:
         raise ValueError
     return sorted(roots)
 
 
-def check_movie_download_space(directories, downloaders, template, *, storage_verified, probe=None):
+def check_movie_download_space(directories, downloaders, template, *, storage_verified, probe=None, media_type="movie"):
     result = {"status": "unknown", "fingerprint": None, "locations_checked": 0,
               "minimum_free_bytes": MINIMUM_FREE_BYTES, "available_bytes": None}
     if storage_verified is not True:
@@ -209,7 +209,7 @@ def check_movie_download_space(directories, downloaders, template, *, storage_ve
             template = {}
         if not isinstance(template, dict) or not isinstance(downloaders, list) or not 1 <= len(downloaders) <= 32:
             raise ValueError
-        roots = _destinations(directories, template)
+        roots = _destinations(directories, template, {"movie": "电影", "tv": "电视剧"}[media_type])
         selected = template.get("downloader")
         choices = []
         names = set()
@@ -239,14 +239,14 @@ def check_movie_download_space(directories, downloaders, template, *, storage_ve
             free.append(available)
         minimum = min(free)
         return {**result, "status": "ready" if minimum >= MINIMUM_FREE_BYTES else "low",
-                "fingerprint": _digest(["movie-download-space-v1", sorted(choices), locations, MINIMUM_FREE_BYTES]),
+                "fingerprint": _digest([f"{media_type}-download-space-v1", sorted(choices), locations, MINIMUM_FREE_BYTES]),
                 "locations_checked": len(roots), "available_bytes": minimum}
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError, IndexError, OverflowError):
         return result
 
 
-def host_movie_download_space(*, storage_verified, systemconfig=None):
-    """Read only the three MP settings used by the native ordinary-movie chain."""
+def host_movie_download_space(*, storage_verified, systemconfig=None, media_type="movie"):
+    """Read the matching MP subscription template and possible native download paths."""
     if storage_verified is True:
         try:
             from app.core.config import settings
@@ -254,11 +254,13 @@ def host_movie_download_space(*, storage_verified, systemconfig=None):
             if systemconfig is None:
                 from app.db.systemconfig_oper import SystemConfigOper
                 systemconfig = SystemConfigOper()
-            key = SystemConfigKey.DefaultMovieSubscribeConfig.value
+            if media_type not in ("movie", "tv"):
+                raise ValueError
+            key = (SystemConfigKey.DefaultMovieSubscribeConfig if media_type == "movie" else SystemConfigKey.DefaultTvSubscribeConfig).value
             template = getattr(settings, key) if hasattr(settings, key) else systemconfig.get(key)
             return check_movie_download_space(systemconfig.get(SystemConfigKey.Directories),
                                               systemconfig.get(SystemConfigKey.Downloaders),
-                                              template, storage_verified=True)
+                                              template, storage_verified=True, media_type=media_type)
         except Exception:
             pass
     return check_movie_download_space(None, None, None, storage_verified=False)

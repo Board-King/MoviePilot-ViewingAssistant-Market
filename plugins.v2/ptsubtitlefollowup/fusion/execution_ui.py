@@ -13,6 +13,7 @@ EXECUTION_DEFAULTS = {
     "fusion_execution_owner": "",
     "fusion_execution_sources": [],
     "fusion_execution_daily_limit": 3,
+    "fusion_execution_tv_daily_limit": 1,
     "fusion_execution_preset": "ranked",
     "fusion_execution_legacy_isolated": False,
     "fusion_execution_storage_verified": False,
@@ -20,7 +21,8 @@ EXECUTION_DEFAULTS = {
 
 _SOURCE = "tmdb_popular_movie"
 _SOURCE_LABEL = SOURCE_SPECS[_SOURCE]["label"]
-_PRESETS = {"ranked": "按匹配分", "conservative": "严选", "balanced": "均衡"}
+_PERSONAL_SOURCES = ("tmdb_personal_movie", "tmdb_personal_tv")
+_PRESETS = {"personal": "按观影口味", "ranked": "按匹配分", "conservative": "严选", "balanced": "均衡"}
 _CHOICE_PROPS = {"item-title": "title", "item-value": "value"}
 _STATES = {
     "disabled": "已关闭", "ready": "等待授权", "armed": "已授权",
@@ -37,7 +39,7 @@ _REASONS = {
     "CONFIG_UNAVAILABLE": "暂时无法读取执行配置，请检查 MoviePilot 的存储状态。",
     "SCOPE_CHANGED": "已授权的范围发生变化，请核对当前设置后重新授权。",
     "OWNER_REQUIRED": "请在设置中填写有效的 MoviePilot 订阅用户名。",
-    "SOURCE_REQUIRED": "请选择要授权的电影来源并保存。",
+    "SOURCE_REQUIRED": "请在设置中核对选片来源并保存。",
     "LEGACY_NOT_ISOLATED": "请先停用该来源原有的自动订阅入口，并在设置中确认。",
     "PROFILE_REQUIRED": "请先验证当前 Emby 用户并更新观影偏好。",
     "INVALID_POLICY": "请检查已保存的预设和每日额度。",
@@ -48,10 +50,10 @@ _REASONS = {
     "LIBRARY_UNVERIFIED": "未能核实完整媒体库或作品身份。请检查媒体库连接和作品资料。",
     "SUBSCRIPTION_UNVERIFIED": "无法核实现有或已完成的订阅。请检查 MoviePilot 订阅记录。",
     "SUBSCRIPTION_CONFLICT": "现有订阅与本次目标存在冲突。请在 MoviePilot 中核对作品和订阅用户。",
-    "LIBRARY_PRESENT": "媒体库已有这部电影，本次跳过。",
+    "LIBRARY_PRESENT": "媒体库已有这部作品，本次跳过。",
     "PREEXISTING": "MoviePilot 已有对应订阅，本次跳过。",
     "SPACE_UNVERIFIED": "下载目录映射未确认。请核对 MoviePilot 与下载器的实际目录和挂载。",
-    "SPACE_LOW": "电影下载目录可用空间低于 100 GiB，释放空间后再试。",
+    "SPACE_LOW": "下载目录可用空间低于 100 GiB，释放空间后再试。",
 }
 _LOCAL_TZ = timezone(timedelta(hours=8))
 _RANKED_DEDUP = "按 TMDB 编号查重。无编号时核对片名和年份，别名差异仍可能造成重复订阅。"
@@ -64,6 +66,12 @@ _OUTCOMES = (("new", "已新增"), ("subscribed", "已有订阅"), ("owned", "�
 
 
 def get_execution_form():
+    legacy_feed = _field("VSelect", "fusion_execution_sources", "电影片单", multiple=True,
+                         chips=True, clearable=True, items=[{"title": _SOURCE_LABEL, "value": _SOURCE}], **_CHOICE_PROPS)
+    legacy_feed["props"]["show"] = "{{ fusion_execution_preset !== 'personal' }}"
+    tv_quota = _field("VTextField", "fusion_execution_tv_daily_limit", "每日剧集上限（部）",
+                      type="number", min=1, max=3)
+    tv_quota["props"]["show"] = "{{ fusion_execution_preset === 'personal' }}"
     return [_card("自动订阅", [
         _node("VRow", content=[
             _field("VSwitch", "fusion_execution_enabled", "启用自动订阅", cols=12, color="primary")
@@ -72,20 +80,20 @@ def get_execution_form():
           _node("VRow", content=[
             _field("VTextField", "fusion_execution_owner", "MoviePilot 订阅用户名", autocomplete="off",
                    hint="用于创建订阅，与 Emby 用户分开设置。"),
-            _field("VSelect", "fusion_execution_sources", "从哪个片单挑电影", multiple=True,
-                   chips=True, clearable=True, items=[{"title": _SOURCE_LABEL, "value": _SOURCE}], **_CHOICE_PROPS),
             _field("VSelect", "fusion_execution_preset", "选片方式", items=[
+                {"title": "按观影口味 · 电影和剧集", "value": "personal"},
                 {"title": "按匹配分 · 从高到低选前几部", "value": "ranked"},
                 {"title": "严选 · 匹配 ≥78，TMDB ≥8", "value": "conservative"},
                 {"title": "均衡 · 匹配 ≥68，TMDB ≥8", "value": "balanced"},
             ], **_CHOICE_PROPS),
-            _field("VTextField", "fusion_execution_daily_limit", "每日上限（部）", type="number", min=1, max=5,
-                   hint="按匹配分可选 1–3 部，严选和均衡可选 1–5 部。"),
+            legacy_feed,
+            _field("VTextField", "fusion_execution_daily_limit", "每日电影上限（部）", type="number", min=1, max=5),
+            tv_quota,
           ]),
           _node("div", "授权前核对", props={"class":"text-subtitle-2 mt-3 mb-1"}),
           _node("VRow", props={"dense":True}, content=[
             _field("VCheckbox", "fusion_execution_legacy_isolated", "同来源的旧自动订阅已停用，或原本没有", cols=12, density="compact"),
-            _field("VCheckbox", "fusion_execution_storage_verified", "已核对 MP、下载器临时目录和最终电影目录指向同一存储，没有改写电影下载路径的规则", cols=12, density="compact"),
+            _field("VCheckbox", "fusion_execution_storage_verified", "已核对 MP、下载器临时目录和最终下载目录在同一存储，且没有改写路径的规则", cols=12, density="compact"),
           ]),
           _caption("保存后核对范围并授权。"),
         ])
@@ -118,7 +126,7 @@ def _setting(label, value):
     ])
 
 
-def _recent(rows):
+def _recent(rows, *, personal=False):
     entries = []
     for row in rows[:5] if isinstance(rows, list) else []:
         if not isinstance(row, dict):
@@ -126,19 +134,37 @@ def _recent(rows):
         state = row.get("state")
         result = _RESULTS.get(state.lower(), "状态待核对") if isinstance(state, str) else "状态待核对"
         stamp = _when(row.get("updated_at"))
-        entries.append(_node("div", props={"class": "d-flex flex-wrap justify-space-between ga-2 py-1"}, content=[
-            _node("span", _text(row.get("title"), "未命名作品", limit=180), props={"class": "text-break"}),
-            _caption(" · ".join(filter(None, [result, stamp])), ""),
-        ]))
+        title = _text(row.get("title"), "未命名作品", limit=180)
+        if personal:
+            season = row.get("season")
+            tv = row.get("media_type") == "tv"
+            if tv and type(season) is int and season > 0:
+                title += f" · 第 {season} 季"
+            score = row.get("match_score")
+            match = _text(row.get("match_reason"), limit=120)
+            detail = " · ".join(filter(None, ["剧集" if tv else "电影" if row.get("media_type") == "movie" else "",
+                              f"匹配 {score:g} 分" if type(score) in (int, float) and 0 <= score <= 100 else "", match]))
+            entries.append(_node("li", props={"class":"va-pick"}, content=[
+                _node("div", content=[_node("strong", title), *([_caption(detail, "")] if detail else [])]),
+                _node("span", result, props={"class":"va-pick-state", "title":stamp,
+                       "data-confirmed":"true" if isinstance(state, str) and state.lower() == "confirmed" else "false"}),
+            ]))
+        else:
+            entries.append(_node("div", props={"class": "d-flex flex-wrap justify-space-between ga-2 py-1"}, content=[
+                _node("span", title, props={"class": "text-break"}), _caption(" · ".join(filter(None, [result, stamp])), ""),
+            ]))
     if not entries:
         return []
+    if personal:
+        return [_node("div", "最近订阅记录", props={"class":"text-subtitle-2 mt-3"}),
+                _node("ul", props={"class":"va-picks"}, content=entries)]
     return [_node("details", props={"class": "mt-3"}, content=[
         _node("summary", "最近执行记录", props={"class": "text-caption text-primary cursor-pointer"}),
         _node("div", props={"class": "pt-2"}, content=entries),
     ])]
 
 
-def _scan_result(scan):
+def _scan_result(scan, *, personal=False):
     if not scan:
         return [_caption("尚无选片明细，下次实际选片后显示。", "mt-2")]
     checked_at = _when(scan["at"])
@@ -146,11 +172,13 @@ def _scan_result(scan):
         why = "偏好或候选未就绪" if scan["input"] == "profile" else "片单未就绪"
         return [_caption(f"上次选片 · {checked_at} · {why}，未开始筛选。")]
     n, passed, checked = scan["candidates"], scan["eligible"], scan["checked"]
+    kind = "影视" if personal else "电影"
+    gates = (*_GATES, ("season", "缺少可核实的订阅季")) if personal else _GATES
     if not n:
-        summary = "片单中没有可辨认的候选电影"
+        summary = f"片单中没有可辨认的候选{kind}"
     elif not passed:
-        gate, label = max(_GATES, key=lambda g: scan[g[0]])
-        summary = f"{n} 部电影均未通过，{scan[gate]} 部{label}"
+        gate, label = max(gates, key=lambda g: scan.get(g[0], 0))
+        summary = f"{n} 部{kind}均未通过，{scan[gate]} 部{label}" if scan.get(gate) else "本轮暂无符合条件的候选"
     elif not checked:
         summary = f"{passed} 部通过筛选，已有执行记录，本轮无需再提交"
     else:
@@ -159,14 +187,17 @@ def _scan_result(scan):
         summary = f"核对 {checked} 部，新增 {scan['new']} 部"
         if outcomes:
             summary += "，" + "、".join(f"{count} 部{title}" for count, title in outcomes[:2])
-    facts = [f"片单电影 {n} 部 → 通过筛选 {passed} 部 → 本轮核对 {checked} 部"]
-    facts.extend(f"{scan[key]} 部{label}" for key, label in _GATES if scan[key])
+    facts = [f"片单{kind} {n} 部 → 通过筛选 {passed} 部 → 本轮核对 {checked} 部"]
+    facts.extend(f"{scan[key]} 部{label}" for key, label in gates if scan.get(key))
     if scan["previous"]:
         facts.append(f"此前已处理 {scan['previous']} 部")
     facts.extend(f"{scan[key]} 部{label}" for key, label in _OUTCOMES if scan[key])
     if scan["unseen"]:
         facts.append(f"尚未核对 {scan['unseen']} 部")
-    facts.append(f"当轮结束时剩余 {scan['remaining']} 个名额")
+    if personal:
+        facts.append(f"当轮剩余 · 电影 {_counter(scan.get('remaining_movies'))} · 剧集 {_counter(scan.get('remaining_tv'))}")
+    else:
+        facts.append(f"当轮结束时剩余 {scan['remaining']} 个名额")
     return [_node("div", "上次选片 · " + summary, props={"class":"text-body-2 mt-2"}),
             _node("details", props={"class":"va-more"}, content=[
                 _node("summary", f"选片明细 · {checked_at}"),
@@ -180,32 +211,49 @@ def render_execution(status, plugin_id="PtSubtitleFollowup", *, review=False):
     state = status.get("state")
     label = _STATES.get(state, "状态待核对") if isinstance(state, str) else "状态待核对"
     reason, unknown = status.get("last_reason"), status.get("unknown_count")
+    personal_setup = _node("VBtn", "设置电影和剧集", props={"data-va-settings":"personal", "variant":"tonal",
+                            "size":"small", "color":"primary"})
+    show_setup = not review and plugin_id == "PtSubtitleFollowup"
     if (not enabled and not armed and state == "disabled" and unknown == 0
             and reason in (None, "DISABLED", "REVOKED", "NOT_AUTHORIZED")):
-        return [_card("自动订阅", [_caption("已关闭", "")])]
+        return [_card("自动订阅", [_node("div", props={"class":"d-flex flex-wrap align-center justify-space-between ga-2"},
+                      content=[_caption("已关闭 · 可按观影口味发现电影和剧集。", ""), *([personal_setup] if show_setup else [])])])]
     sources = status.get("sources")
     source_label = _SOURCE_LABEL if sources == [_SOURCE] else "尚未选择" if sources == [] else "范围待核对"
     owner = status.get("owner")
     owner_valid = isinstance(owner, str) and bool(owner) and _text(owner, limit=128) == owner
     preset = status.get("preset")
+    personal = preset == "personal"
+    scope_valid = (isinstance(sources, list) and len(sources) == 2 and all(x in sources for x in _PERSONAL_SOURCES)
+                   and status.get("media_types") == ["movie", "tv"]) if personal else (
+                       sources == [_SOURCE] and status.get("media_types") == ["movie"])
+    if personal and scope_valid:
+        source_label = "个性化电影和剧集"
     preset_label = _PRESETS.get(preset) if isinstance(preset, str) else None
     daily_limit = status.get("daily_limit")
-    cap_valid = type(daily_limit) is int and 1 <= daily_limit <= (3 if preset == "ranked" else 5)
+    cap_valid = type(daily_limit) is int and 1 <= daily_limit <= (3 if personal or preset == "ranked" else 5)
+    tv_limit = status.get("tv_daily_limit")
+    tv_valid = type(tv_limit) is int and 1 <= tv_limit <= 3
     scope = [_setting("MoviePilot 账号", owner if owner_valid else "待设置"),
              _setting("选片方式", preset_label or "待设置")]
     profile = _text(status.get("profile_name"), limit=100)
-    if profile and status.get("can_authorize") is True:
+    if profile and (armed or status.get("can_authorize") is True):
         scope.append(_setting("Emby 偏好", profile))
+    needs_binding = personal and enabled and not armed and scope_valid and not profile and status.get("can_authorize") is True
     overview = [_node("div", props={"class":"va-ex-choice"}, content=[
-        _node("strong", source_label), _caption("自动订阅片单", "")])]
+        _node("strong", source_label), _caption("剧集只订最新已开播的一季。" if personal else "自动订阅片单", "")])]
     if preset == "ranked" and cap_valid:
         overview.append(_caption(f"按匹配分选前 {daily_limit} 部，跳过已入库或已订阅的电影。", "mt-1"))
         if not review:
             overview.append(_node("div", _RANKED_DEDUP, props={"class":"text-body-2 mt-1"}))
-    overview.append(_node("div", props={"class":"va-ex-fields"}, content=scope))
+    scope_fields = _node("div", props={"class":"va-ex-fields"}, content=scope)
+    if not personal or review:
+        overview.append(scope_fields)
+    if personal and not review:
+        overview.extend(_recent(status.get("recent"), personal=True))
     scan = _dict(status.get("last_scan"))
-    if armed and not review:
-        overview.extend(_scan_result(scan))
+    if armed and not review and (scan or not personal or not status.get("recent")):
+        overview.extend(_scan_result(scan, personal=personal))
     # Avoid giving a single film's outcome as the explanation for an entire mixed scan.
     if scan and armed and not review and reason in ("LIBRARY_PRESENT", "PREEXISTING", "NO_ELIGIBLE",
             "HELD", "LIBRARY_UNVERIFIED", "SUBSCRIPTION_CONFLICT", "SUBSCRIPTION_UNVERIFIED"):
@@ -220,20 +268,23 @@ def render_execution(status, plugin_id="PtSubtitleFollowup", *, review=False):
     elif state == "blocked":
         overview.append(_caption("请核对已保存的授权范围与 MoviePilot 运行状态。"))
     elif reason == "NO_ELIGIBLE":
-        overview.append(_caption("本轮没有可新增的匹配电影。" if preset == "ranked" else f"本轮没有可按「{preset_label or '当前方式'}」新增的电影。"))
+        overview.append(_caption("本轮暂无可新增的电影或剧季。" if personal else
+                                 "本轮没有可新增的匹配电影。" if preset == "ranked" else f"本轮没有可按「{preset_label or '当前方式'}」新增的电影。"))
     elif reason == "HELD":
         overview.append(_caption("本轮候选未通过订阅前检查，已暂缓。"))
     if not review and preset in ("balanced", "conservative") and plugin_id == "PtSubtitleFollowup":
         overview.append(_node("VBtn", "改用匹配分", props={"data-va-settings":"ranked", "variant":"tonal",
                               "size":"small", "color":"primary", "class":"mt-2"}))
+    if show_setup and not personal:
+        overview.append(personal_setup)
     if type(unknown) is int and 0 < unknown <= 1_000_000:
         overview.append(_node("VAlert", props={"type": "warning", "variant": "tonal", "density": "compact",
                                             "class": "mt-3", "text": f"{unknown} 笔提交结果待核实，额度继续保留。"}))
     digest = status.get("authorization_digest")
     valid_digest = isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest) is not None
     can_authorize = (enabled and not armed and status.get("can_authorize") is True and owner_valid
-                     and sources == [_SOURCE] and status.get("media_types") == ["movie"]
-                     and preset_label is not None and cap_valid and valid_digest)
+                     and scope_valid and not needs_binding and (not personal or tv_valid) and preset_label is not None
+                     and cap_valid and valid_digest)
     if armed:
         note = "撤销后停止新增，已有订阅保留。"
         action = _button("撤销自动订阅授权", plugin_id, "execution/revoke", "POST")
@@ -249,7 +300,12 @@ def render_execution(status, plugin_id="PtSubtitleFollowup", *, review=False):
             action.pop("events", None)
     authority = _node("div", props={"class": "d-flex flex-wrap align-center ga-2 mt-2",
                                     "data-va-execution-review-action": True}, content=[_caption(note, ""), action])
-    if review or not armed:
+    if review and needs_binding:
+        overview.append(_node("div", "验证所选 Emby 账号后即可授权。", props={"class":"text-body-2",
+                              "data-va-verify-binding":True}))
+    elif needs_binding and show_setup:
+        overview.append(personal_setup)
+    elif review or not armed:
         overview.append(authority)
     if enabled or armed:
         rules = []
@@ -260,26 +316,37 @@ def render_execution(status, plugin_id="PtSubtitleFollowup", *, review=False):
                      _caption("缺少可核对的共同偏好，或媒体库中有电影缺少 TMDB 编号时，会暂缓新增。", "mt-1")]
         overview.append(_node("details", props={"class":"va-more"}, content=[
             _node("summary", "选片规则与授权"),
+            *([scope_fields] if personal and not review else []),
             *rules,
             *([authority] if armed and not review else []),
             _caption("额度按北京时间结算。更改授权范围需重新授权。", "mt-1"),
-            _caption("每个可用电影下载目录须至少有 100 GiB 可用空间。Unraid 用户共享显示汇总空间。", "mt-1"),
+            _caption("每个可用下载目录须至少有 100 GiB 可用空间。Unraid 用户共享显示汇总空间。", "mt-1"),
         ]))
-    overview.extend(_recent(status.get("recent")))
+    if not personal:
+        overview.extend(_recent(status.get("recent")))
     card = _card("自动订阅", overview)
     heading = card["content"][0]
     heading["props"]["class"] += " d-flex flex-wrap align-center ga-2"
     tint = ("success" if state == "armed" else "warning" if state in ("blocked", "unknown", "paused") else "secondary")
     heading["content"] = [_node("VChip", label, props={"size":"small", "variant":"tonal", "color":tint})]
-    if enabled or armed:
-        used = status.get("used_today")
+    def quota(label, used, limit, valid):
         meter = []
-        if cap_valid and type(used) is int and used >= 0:
+        if valid and type(used) is int and used >= 0:
             meter = [_node("span", props={"class":"va-quota-meter","aria-hidden":"true"}, content=[
-                _node("span", props={"class":"is-used" if n < used else ""}) for n in range(daily_limit)])]
-        heading["content"].append(_node("div", props={"class":"va-ex-quota",
-                                                     "title":"今日已用 / 每日上限（北京时间）"}, content=[
-            _caption("今日已用", ""),
-            _node("strong", f"{_counter(used)} / {daily_limit if cap_valid else '—'}"), *meter
-        ]))
+                _node("span", props={"class":"is-used" if n < used else ""}) for n in range(limit)])]
+        return _node("div", props={"class":"va-ex-quota", "title":"今日已用 / 每日上限（北京时间）"}, content=[
+            _caption(label, ""), _node("strong", f"{_counter(used)} / {limit if valid else '—'}"), *meter])
+    if enabled or armed:
+        if personal:
+            if review:
+                budgets = [("电影", daily_limit if cap_valid else "—"), ("剧集", tv_limit if tv_valid else "—")]
+                heading["content"].append(_node("div", props={"class":"va-daily-budgets"}, content=[
+                    _caption("每天最多", ""), *[_node("strong", f"{limit} 部{kind}", props={"class":"text-body-2"})
+                                               for kind, limit in budgets]]))
+            else:
+                heading["content"].append(_node("div", props={"class":"va-daily-budgets", "aria-label":"今日已用名额"}, content=[
+                    _caption("今日", ""), quota("电影", status.get("used_movies_today"), daily_limit, cap_valid),
+                    quota("剧集", status.get("used_tv_today"), tv_limit, tv_valid)]))
+        else:
+            heading["content"].append(quota("今日已用", status.get("used_today"), daily_limit, cap_valid))
     return [card]

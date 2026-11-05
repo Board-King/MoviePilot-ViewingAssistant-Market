@@ -1,4 +1,4 @@
-"""MoviePilot v2.15.6 subscription boundary for ordinary TMDB movies.
+"""MoviePilot v2.15.6 subscription boundary for TMDB movies and ordinary TV seasons.
 
 Read contracts: Emby /Features requires an administrator and /Items supports
 root recursive queries, AnyProviderIdEquals and HasTmdbId. Never query user
@@ -37,13 +37,16 @@ def _tmdb(value):
     return None
 
 
-def _movie(identity):
+def _supported(identity):
     if not isinstance(identity, Mapping):
         return False
     title, year = identity.get("title"), identity.get("year")
-    return (identity.get("provider") == "themoviedb" and identity.get("media_type") == "movie"
+    kind, season = identity.get("media_type"), identity.get("season")
+    valid_target = ((kind == "movie" and season is None)
+                    or (kind == "tv" and type(season) is int and 1 <= season <= 99))
+    return (identity.get("provider") == "themoviedb" and valid_target
             and isinstance(identity.get("media_id"), str) and _tmdb(identity["media_id"]) is not None
-            and identity.get("season") is None and identity.get("episode_group") is None
+            and identity.get("episode_group") is None
             and isinstance(title, str) and bool(title.strip()) and len(title) <= 240 and title.isprintable()
             and (year is None or type(year) is int and 1800 <= year <= 2200))
 
@@ -72,7 +75,14 @@ def _existing(rows, identity, owner, *, external_ids=None):
         return {"status": "unknown", "sid": None}
     matches = []
     incomplete = False
+    tv = identity["media_type"] == "tv"
     for row in rows:
+        if tv:
+            if row["type"] == "电影" and row["season"] is None:
+                continue  # TMDB series and movie IDs have independent namespaces.
+            if (row["type"] == "电视剧" and row["episode_group"] is None
+                    and type(row["season"]) is int and row["season"] >= 0 and row["season"] != identity["season"]):
+                continue
         tmdb_ids = set()
         provider, media_id = row["media_source"], row["media_id"]
         if provider in ("themoviedb", "tmdb"):
@@ -85,7 +95,7 @@ def _existing(rows, identity, owner, *, external_ids=None):
         if identity["media_id"] not in tmdb_ids:
             # Compare in Douban's own namespace only when the movie and its
             # exact IMDb cross-reference are both known; never search by name.
-            if not tmdb_ids and provider == "douban" and row["type"] == "电影" and external_ids:
+            if not tv and not tmdb_ids and provider == "douban" and row["type"] == "电影" and external_ids:
                 douban_id = _tmdb(media_id)
                 aliases = [row.get("doubanid")]
                 if legacy_key:
@@ -99,10 +109,12 @@ def _existing(rows, identity, owner, *, external_ids=None):
                         continue
             # An unmapped movie may already represent the request on a different
             # provider. An explicit TV row with no matching key cannot own it.
-            if row["type"] != "电视剧" and (not tmdb_ids or None in tmdb_ids or len(tmdb_ids) != 1):
+            relevant = tv or row["type"] != "电视剧"
+            if relevant and (not tmdb_ids or None in tmdb_ids or len(tmdb_ids) != 1):
                 incomplete = True
             continue
-        exact_owner_row = (row["type"] == "电影" and row["season"] is None and row["episode_group"] is None
+        exact_season = type(row["season"]) is int and row["season"] == identity["season"] if tv else row["season"] is None
+        exact_owner_row = (row["type"] == ("电视剧" if tv else "电影") and exact_season and row["episode_group"] is None
                            and row["username"] == owner and row["best_version"] == 0
                            and tmdb_ids == {identity["media_id"]}
                            and provider in (None, "", "tmdb", "themoviedb")
@@ -130,13 +142,13 @@ def _douban_movie_id(result):
 class _ExactRecognition:
     """One call's receiver for the pinned native method; no singleton edits."""
 
-    def __init__(self, chain, identity, movie_type, may_dispatch):
-        self.chain, self.identity, self.movie_type = chain, identity, movie_type
+    def __init__(self, chain, identity, media_type, may_dispatch):
+        self.chain, self.identity, self.media_type = chain, identity, media_type
         self.may_dispatch = may_dispatch
         self.past_guard = False
 
     def _check(self, media):
-        if (media is None or media.type != self.movie_type or media.source != "themoviedb"
+        if (media is None or media.type != self.media_type or media.source != "themoviedb"
                 or _tmdb(media.tmdb_id) != self.identity["media_id"]
                 or getattr(media, "media_id", None) not in (None, "", self.identity["media_id"],
                                                             int(self.identity["media_id"]))
@@ -150,6 +162,12 @@ class _ExactRecognition:
         return self._check(self.chain.recognize_media(**kwargs))
 
     def obtain_images(self, *, mediainfo):
+        if self.identity["media_type"] == "tv":
+            seasons = getattr(mediainfo, "seasons", None)
+            episodes = seasons.get(self.identity["season"]) if isinstance(seasons, dict) else None
+            if (not isinstance(episodes, list) or not episodes
+                    or not all(type(number) is int and number > 0 for number in episodes)):
+                raise _NotSent("Native season missing")
         result = self.chain.obtain_images(mediainfo=mediainfo)
         self._check(mediainfo)
         return result
@@ -189,7 +207,7 @@ class _MoviePilot:
         self.subscribe = modules["app.db.models.subscribe"].Subscribe
         self.history = SubscribeHistory
         self.chain_type = modules["app.chain.subscribe"].SubscribeChain
-        self.movie_type = MediaType.MOVIE
+        self.movie_type, self.tv_type = MediaType.MOVIE, MediaType.TV
         add = self.chain_type.add
         parameters = inspect.signature(add).parameters
         if (add.__module__ != "app.chain.subscribe" or add.__qualname__ != "SubscribeChain.add"
@@ -225,13 +243,17 @@ class _MoviePilot:
                                     sub.best_version).limit(MAX_SUBSCRIPTIONS + 1)
             return connection.execute(statement).mappings().all()
 
-    def external_ids(self, media_id):
+    @staticmethod
+    def _detail(kind, media_id):
         from app.core.config import settings
-        from app.modules.douban.apiv2 import DoubanApi
         from .sources import TmdbSourceClient
         config = {"api_key": settings.TMDB_API_KEY, "proxies": settings.PROXY if settings.PROXY_HOST else None}
         with TmdbSourceClient(config, deadline_seconds=10) as client:
-            detail = client.display_detail("movie", media_id)
+            return client.display_detail(kind, media_id)
+
+    def external_ids(self, media_id):
+        from app.modules.douban.apiv2 import DoubanApi
+        detail = self._detail("movie", media_id)
         imdb = detail.get("imdb_id")
         if _tmdb(detail.get("id")) != media_id or not isinstance(imdb, str) or not re.fullmatch(r"tt[0-9]{7,12}", imdb):
             return {}
@@ -241,12 +263,23 @@ class _MoviePilot:
         return {"imdb": imdb, "douban": douban}
 
     def add(self, identity, owner, may_dispatch):
-        receiver = _ExactRecognition(self.chain_type(), identity, self.movie_type, may_dispatch)
         _permit(may_dispatch)
+        media_type = self.movie_type
+        if identity["media_type"] == "tv":
+            from .series_subscription import latest_aired_season
+            try:
+                current = latest_aired_season(self._detail("tv", identity["media_id"]), identity["media_id"])
+            except Exception:
+                raise _NotSent("Series metadata unavailable") from None
+            if current != identity["season"]:
+                raise _NotSent("Aired season changed or unconfirmed")
+            media_type = self.tv_type
+            _permit(may_dispatch)
+        receiver = _ExactRecognition(self.chain_type(), identity, media_type, may_dispatch)
         try:
             return self.native_add(receiver, title=identity["title"], year=str(identity["year"] or ""),
-                                   mtype=self.movie_type, media_source="themoviedb", media_id=identity["media_id"],
-                                   tmdbid=int(identity["media_id"]), season=None, episode_group=None,
+                                   mtype=media_type, media_source="themoviedb", media_id=identity["media_id"],
+                                   tmdbid=int(identity["media_id"]), season=identity["season"], episode_group=None,
                                    username=owner, owner_scope=True, message=False)
         except _NotSent:
             if receiver.past_guard:
@@ -319,7 +352,63 @@ def _unidentified_match(records, identity):
     return "no_known_match"
 
 
-def _emby_movie(config, identity, deadline, indexed_only, gap_cache):
+def _emby_season(get, identity, query):
+    """A series container or a different season is insufficient evidence of ownership."""
+    media_id, season = identity["media_id"], identity["season"]
+    shows = get("/Items", {**query, "IncludeItemTypes": "Series", "AnyProviderIdEquals": "tmdb." + media_id,
+                           "Limit": 8})
+    items, total = shows.get("Items"), shows.get("TotalRecordCount")
+    if (type(total) is not int or not 0 <= total <= 8 or not isinstance(items, list) or len(items) != total):
+        return "unknown"
+    seen_shows = set()
+    for show in items:
+        if not isinstance(show, dict):
+            return "unknown"
+        providers, show_id = show.get("ProviderIds"), show.get("Id")
+        if (show.get("Type") != "Series" or not isinstance(providers, dict)
+                or {_tmdb(v) for k, v in providers.items() if k.casefold() == "tmdb"} != {media_id}
+                or not isinstance(show_id, str) or not re.fullmatch(r"[0-9a-zA-Z-]{1,128}", show_id)
+                or show_id in seen_shows):
+            return "unknown"
+        seen_shows.add(show_id)
+        children = {**query, "ParentId": show_id, "IncludeItemTypes": "Episode", "IsPlaceHolder": "false"}
+        hits = _query_result(get("/Items", {**children, "ParentIndexNumber": season}))
+        if hits:
+            item = hits[0]
+            if (item.get("Type") == "Episode" and item.get("SeriesId") == show_id
+                    and type(item.get("ParentIndexNumber")) is int and item["ParentIndexNumber"] == season
+                    and type(item.get("IndexNumber")) is int and item["IndexNumber"] > 0
+                    and item.get("LocationType") != "Virtual" and item.get("IsPlaceHolder") is not True):
+                return "present"
+            return "unknown"
+        # Missing index numbers can hide episodes from the filtered lookup. Prove
+        # that each child is from a different numbered season before allowing a write.
+        seen_episodes = set()
+        expected = None
+        while True:
+            page = get("/Items", {**children, "SortBy": "SortName", "Limit": 128, "StartIndex": len(seen_episodes)})
+            count, rows = page.get("TotalRecordCount"), page.get("Items")
+            if (type(count) is not int or not 0 <= count <= 512
+                    or (expected is not None and count != expected) or not isinstance(rows, list)
+                    or len(rows) != min(128, count - len(seen_episodes))):
+                return "unknown"
+            expected = count
+            for item in rows:
+                if not isinstance(item, dict):
+                    return "unknown"
+                key, number = item.get("Id"), item.get("ParentIndexNumber")
+                if (item.get("Type") != "Episode" or item.get("SeriesId") != show_id or not isinstance(key, str)
+                        or not key or key in seen_episodes or type(number) is not int or number < 0 or number == season):
+                    return "unknown"
+                seen_episodes.add(key)
+            if len(seen_episodes) == count:
+                break
+    # Shows lacking a TMDB mapping could be another copy of the same season.
+    gaps = _query_result(get("/Items", {**query, "IncludeItemTypes": "Series", "HasTmdbId": "false"}))
+    return "unknown" if gaps else "absent"
+
+
+def _emby_library(config, identity, deadline, indexed_only, gap_cache):
     import requests
     from .emby import _base_url
     base, token = _base_url(config.get("host")), config.get("apikey")
@@ -354,6 +443,8 @@ def _emby_movie(config, identity, deadline, indexed_only, gap_cache):
             return "unknown"
         query = {"Recursive": "true", "IncludeItemTypes": "Movie", "Fields": "ProviderIds",
                  "EnableUserData": "false", "EnableImages": "false", "Limit": 1, "StartIndex": 0}
+        if identity["media_type"] == "tv":
+            return _emby_season(get, identity, query)
         media_id = identity["media_id"]
         hits = _query_result(get("/Items", {**query, "AnyProviderIdEquals": "tmdb." + media_id}))
         if hits:
@@ -382,7 +473,7 @@ def _emby_movie(config, identity, deadline, indexed_only, gap_cache):
 
 
 class HostSubscriptionAdapter:
-    def __init__(self, server_supplier, *, native_factory=_verified_host, library_probe=_emby_movie):
+    def __init__(self, server_supplier, *, native_factory=_verified_host, library_probe=_emby_library):
         self._servers, self._native, self._probe = server_supplier, native_factory, library_probe
         self._gap_cache = {}
         self._external_ids = lru_cache(maxsize=8)(self._read_external_ids)
@@ -406,7 +497,7 @@ class HostSubscriptionAdapter:
         return result
 
     def lookup_subscription(self, identity, owner, *, indexed_only=False):
-        if _movie(identity) and self.compatibility(owner)["ready"]:
+        if _supported(identity) and self.compatibility(owner)["ready"]:
             try:
                 host = self._native()
                 external = self._external_ids if indexed_only else None
@@ -422,7 +513,7 @@ class HostSubscriptionAdapter:
         return {"status": "unknown", "sid": None}
 
     def lookup_library(self, identity, *, indexed_only=False, fresh=False):
-        if not _movie(identity):
+        if not _supported(identity):
             return "unknown"
         try:
             servers = self._servers()
@@ -446,7 +537,8 @@ class HostSubscriptionAdapter:
                 statuses.append(status)
             if all(status == "absent" for status in statuses):
                 return "absent"
-            if indexed_only is True and all(status in ("absent", "no_known_match") for status in statuses):
+            if (identity["media_type"] == "movie" and indexed_only is True
+                    and all(status in ("absent", "no_known_match") for status in statuses)):
                 return "no_known_match"
             return "unknown"
         except Exception:
@@ -461,7 +553,7 @@ class HostSubscriptionAdapter:
         except _NotSent:
             return not_sent
         initial = self.compatibility(owner)
-        if not initial["ready"] or not _movie(identity):
+        if not initial["ready"] or not _supported(identity):
             return not_sent
         before = self.lookup_subscription(identity, owner, indexed_only=indexed_only)
         if before["status"] == "existing":
@@ -469,7 +561,8 @@ class HostSubscriptionAdapter:
         if before["status"] != "absent":
             return not_sent
         library = self.lookup_library(identity, indexed_only=indexed_only, fresh=True)
-        if library != "absent" and not (indexed_only is True and library == "no_known_match"):
+        if library != "absent" and not (identity["media_type"] == "movie" and indexed_only is True
+                                        and library == "no_known_match"):
             return not_sent
         try:
             if self.compatibility(owner) != initial or self.lookup_subscription(identity, owner, indexed_only=indexed_only)["status"] != "absent":
