@@ -6,13 +6,15 @@
 
 ## 安装
 
-支持 **MoviePilot 2.15.6**。用管理员账号打开「插件市场设置」，点击 **同步 Wiki**，回到插件市场搜索 **观影助手** 并安装。本插件源已由 MoviePilot Wiki 收录。[收录记录](https://github.com/jxxghp/MoviePilot-Wiki/pull/47)
+支持 **MoviePilot V3 3.2.9 / V2 2.15.6**。用管理员账号打开「插件市场设置」，点击 **同步 Wiki**，回到插件市场搜索 **观影助手** 并安装。本插件源已由 MoviePilot Wiki 收录。[收录记录](https://github.com/jxxghp/MoviePilot-Wiki/pull/47)
 
 也可以在市场设置中手动追加仓库地址。
 
 ```text
 https://github.com/Board-King/MoviePilot-ViewingAssistant-Market
 ```
+
+从 V2 升级到 V3 后，打开插件重新确认一次自动订阅范围。当前支持标准 Python 与 SQLite 部署，暂不支持 `v3t` 和 PostgreSQL。
 
 ## 开启每日自动发现
 

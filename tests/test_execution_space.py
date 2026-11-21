@@ -72,6 +72,38 @@ class SpaceTests(unittest.TestCase):
         self.assertEqual(tv({"save_path": "/media/movies"})["status"], "unknown")
         self.assertEqual(tv({"save_path": "/media/tv"})["status"], "ready")
 
+    def test_v3_implicit_priority_and_category_ids_do_not_reuse_v2_directory_order(self):
+        self.dirs[0]["priority"], self.dirs[1]["priority"] = 20, 10
+        def v3(template=None):
+            return space.check_movie_download_space(self.dirs, self.downloaders, template,
+                storage_verified=True, probe=self.probe, host_version="v3.2.9")
+        old = self.check()
+        self.probed.clear()
+        result = v3()
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(self.probed, ["/array/general"])
+        self.assertNotEqual(result["fingerprint"], old["fingerprint"])
+        # Blank type no longer bypasses a fixed category; the next wildcard
+        # remains a possible target for every other category.
+        self.dirs[1].update(media_category_id="category-1", media_category=None)
+        self.dirs.append({"storage": "local", "download_path": "/media/movies/sub", "priority": 30})
+        self.probed.clear()
+        self.assertEqual(v3()["status"], "ready")
+        self.assertEqual(set(self.probed), {"/array/general", "/media/movies", "/media/movies/sub"})
+
+    def test_v3_explicit_root_accounts_for_category_rank_and_type_subdirectory(self):
+        self.dirs = [
+            {"storage": "local", "download_path": "/media/movies", "priority": 0,
+             "download_type_folder": True},
+            {"storage": "local", "download_path": "/media/movies", "priority": 9,
+             "media_type": "电影", "media_category_id": "category-1", "download_category_folder": True},
+        ]
+        self.volumes["/media/movies/电影"] = {"mount": "a" * 64, "available_bytes": MIN+1}
+        result = space.check_movie_download_space(self.dirs, self.downloaders, {"save_path": "/media/movies"},
+            storage_verified=True, probe=self.probe, host_version="v3.2.9")
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(set(self.probed), {"/media/movies", "/media/movies/电影"})
+
     def test_explicit_template_must_stay_inside_known_movie_roots(self):
         self.assertEqual(self.check({"save_path": "local:/media/movies/sub", "downloader": "Primary"})["status"], "ready")
         self.assertEqual(self.probed, ["/media/movies/sub"])

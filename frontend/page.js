@@ -86,7 +86,7 @@ function makePage(Vue, pluginId) {
         return null
       })
       async function load() {
-        const result = await props.api.get('plugin/page/' + pluginId)
+        const result = vaHostPayload(await props.api.get('plugin/page/' + pluginId))
         if (!Array.isArray(result?.page) || result.render_mode !== 'vue') throw Error('invalid page')
         rows.value = result.page
       }

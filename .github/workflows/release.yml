@@ -26,6 +26,7 @@ jobs:
           set -euo pipefail
           version=$(python -c "import json; print(json.load(open('package.v2.json'))['PtSubtitleFollowup']['version'])")
           tag="PtSubtitleFollowup_v$version"
+          # Both generation indexes and the V3 source fallback must match this one artifact.
           python tools/build.py --tag "$tag"
           python tools/build.py --tag "$tag" --verify
           python -c "import json; from pathlib import Path; x=json.load(open('package.v2.json'))['PtSubtitleFollowup']; Path('dist/notes.md').write_text(x['history']['v'+x['version']], encoding='utf-8')"

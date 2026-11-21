@@ -2,9 +2,13 @@
 
 这个仓库同时提供源代码、插件市场索引和安装包，可单独克隆、修改、测试与发版。
 
-1. 在 `plugins.v2/ptsubtitlefollowup/` 修改 Python，在 `frontend/` 修改界面。新增运行文件时同步审核 `tools/package-files.txt`。
-2. 更新插件类和 `package.v2.json` 中的版本，填写本版更新说明。界面有变动时，运行 `python tools/build.py --write-ui`，提交生成的前端入口。每个发布版本使用新版本号。
-3. 运行 `python -m unittest discover -s tests`、`python tools/build.py` 和 `python tools/build.py --verify`。提交后 GitHub 会在 Linux 和 Windows 上检查。
+1. 在 `plugins.v2/ptsubtitlefollowup/` 修改 Python，在 `frontend/` 修改界面。新增运行文件时同步审核 `tools/package-files.txt`。`plugins.v3/ptsubtitlefollowup/` 是安装回退用的生成副本，不直接编辑。
+2. 同步更新插件类、`package.v2.json` 和 `package.v3.json` 中的版本及本版说明。运行 `python tools/build.py --write-ui --write-v3`，提交生成的前端入口和 V3 副本。两代宿主共用一个 ZIP，每个发布版本使用新版本号。
+3. 运行 `python -m unittest discover -s tests`、`node --test tests/config_flow.cjs tests/federation.test.mjs tests/tonight.test.mjs tests/library-picker.test.mjs`、`python tools/build.py` 和 `python tools/build.py --verify`。构建会拒绝版本不一致或过期的 V3 副本。提交后 GitHub 会在 Linux、Windows 及 Python 3.12、3.14 上检查。
 4. 在 GitHub 的 **Actions → Publish MoviePilot release → Run workflow** 选择 `main`。检查通过后会发布 ZIP 和 SHA-256。用户在 MoviePilot 的插件市场检查更新即可。同一发行仓后续更新无需重复向 Wiki 申请。
 
-目前支持 MoviePilot 2.15.6。自动订阅使用该宿主版本已验证的接口，上调兼容范围前要在目标宿主复验。请勿将真实配置、站点凭证、观影记录、NAS 截图或调试数据库提交到此仓库。
+目前支持 MoviePilot V2 2.15.6 和 V3 3.2.9 的标准 Python、SQLite 部署，暂不支持 `v3t` 或 PostgreSQL。自动订阅逐版本核验原生写入接口，上调兼容范围前须用目标宿主在隔离环境复验：加载与设置、管理员权限、电影与最新已开播季的订阅、去重、双额度、撤销和重载，以及字幕完成事件。测试使用虚构数据并断开外网。
+
+V2 升级 V3 后，宿主和下载目录的授权依据有变化，需要在插件中重新核对并确认自动订阅范围；同一 V2 宿主更新插件不会因此撤销已有授权。NAS 由维护者手动更新。
+
+请勿将真实配置、站点凭证、观影记录、NAS 截图或调试数据库提交到此仓库。

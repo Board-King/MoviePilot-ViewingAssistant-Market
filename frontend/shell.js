@@ -1,6 +1,15 @@
 // Shared chrome keeps navigation and the current action in the same place as
 // the host replaces the data dialog with its configuration dialog.
 let vaHandoff = null
+// V3 wraps host management endpoints in {success,message,data}; V2 supplies
+// their payload directly. Plugin-owned endpoints retain their own contracts.
+function vaHostPayload(response) {
+  if (response && typeof response.success === 'boolean' && Object.hasOwn(response, 'data')) {
+    if (response.success !== true || !response.data || typeof response.data !== 'object') throw Error('host request failed')
+    return response.data
+  }
+  return response
+}
 function vaLeaveBoard(position) {
   vaHandoff = {next:'config',position,time:Date.now()}
 }

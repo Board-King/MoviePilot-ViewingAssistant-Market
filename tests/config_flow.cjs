@@ -15,13 +15,16 @@ const full = {
   fusion_execution_preset: 'conservative', fusion_execution_daily_limit: 1,
   fusion_execution_legacy_isolated: true, fusion_execution_storage_verified: true, unrelated_option: 'preserve-me',
 }
-async function open(config, failAt, directory) {
+async function open(config, failAt, directory, v3 = false) {
   const calls = [], emitted = []
   let persisted = structuredClone(config), mounted, updateField, armed = false, verified = false
   const api = {
     async get(url, options) {
       calls.push(['GET', url])
-      if (url === 'plugin/form/' + id) return { conf: [{ kind: 'form',props:{'data-va-binding':true} }], model: persisted, render_mode: 'vue' }
+      if (url === 'plugin/form/' + id) {
+        const data = {conf:[{kind:'form',props:{'data-va-binding':true}}],model:persisted,render_mode:'vue'}
+        return v3 ? {success:failAt!=='form',message:'',data} : data
+      }
       if (url === base + '/fusion/binding/users') return directory(options.params.server_ref)
       assert.equal(url, scope + 'review')
       if (failAt === 'review') throw Error()
@@ -180,8 +183,8 @@ test('the ranked shortcut prepares a visible draft and does not save or grant on
   assert.ok(!ui.calls.some(call=>call[1] === scope+'authorize'))
 })
 
-test('saved settings get a separately reviewable digest, and only the explicit grant posts it', async () => {
-  const ui = await open(full)
+for (const v3 of [false, true]) test(`V${v3 ? 3 : 2} saved settings require a separate explicit grant`, async () => {
+  const ui = await open(full, null, undefined, v3)
   ui.edit('fusion_execution_daily_limit', 3)
   await ui.button('保存').props.onClick()
   assert.deepEqual(ui.calls.map(call => call.slice(0, 2)), [
@@ -208,6 +211,14 @@ test('saved settings get a separately reviewable digest, and only the explicit g
   assert.equal(ui.calls.length,7)
   assert.ok(ui.button('撤销自动订阅授权'))
   assert.deepEqual(ui.emitted.map(e=>e[0]), ['layout'])
+})
+
+test('a failed V3 form response cannot expose stale data or save a configuration', async () => {
+  const ui = await open(full, 'form', undefined, true)
+  assert.equal(ui.button('保存').props.disabled, true)
+  assert.ok(ui.button('重试'))
+  await ui.button('保存').props.onClick()
+  assert.deepEqual(ui.calls, [['GET', 'plugin/form/' + id]])
 })
 
 test('personal setup proposes separate 3 + 1 budgets and keeps the previous movie grant outside the new draft', async () => {

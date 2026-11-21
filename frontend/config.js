@@ -212,7 +212,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         message.value = ''
         try {
           if (!validId) throw Error()
-          const response = await props.api.get('plugin/form/' + pluginId)
+          const response = vaHostPayload(await props.api.get('plugin/form/' + pluginId))
           if (response?.render_mode !== 'vue' || !Array.isArray(response.conf) || !response.conf.length || !response.model ||
               typeof response.model !== 'object' || Array.isArray(response.model)) throw Error()
           if (!alive) return
@@ -274,7 +274,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
       }
       async function persistDraft(snapshot) {
         if (JSON.stringify(snapshot) === original) return true
-        const latest = await props.api.get('plugin/form/' + pluginId)
+        const latest = vaHostPayload(await props.api.get('plugin/form/' + pluginId))
         if (!alive) return false
         if (!latest?.model || JSON.stringify(latest.model) !== original) {
           conflict.value = true

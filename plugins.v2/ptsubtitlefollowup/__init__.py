@@ -1,4 +1,4 @@
-"""PT original-release subtitle follow-up for MoviePilot V2.
+"""Personal discovery, automatic subscriptions and original-release subtitles.
 
 Only download/transfer completion events and explicitly selected download records
 enter this queue. This plugin never calls transfer, delete, AI or download APIs.
@@ -20,11 +20,9 @@ import requests
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.core.config import settings
-from app.core.event import Event, eventmanager
-from app.log import logger
-from app.plugins import _PluginBase
-from app.schemas.types import EventType, NotificationType
+from .host_compat import (settings, Event, eventmanager, logger, _PluginBase,
+                          EventType, NotificationType, get_engine, get_administrator_dependency,
+                          IS_V3, download_added_date, native_page_action)
 
 from .providers import MTeamProvider, ProviderError, mteam_torrent_id
 from .subtitle_files import (SubtitleError, ExistingSubtitleError,
@@ -115,7 +113,7 @@ class PtSubtitleFollowup(_PluginBase):
     plugin_name = "观影助手"
     plugin_desc = "按你的 Emby 口味，每天自动订阅电影和剧集。"
     plugin_icon = "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png"
-    plugin_version = "0.8.0"
+    plugin_version = "0.8.1"
     plugin_author = "Board-King"
     author_url = "https://github.com/Board-King"
     plugin_url = "https://github.com/Board-King/MoviePilot-ViewingAssistant-Market"
@@ -252,9 +250,7 @@ class PtSubtitleFollowup(_PluginBase):
     def _db(self):
         # Reuse the running host's synchronous SQLAlchemy Engine. Do not open
         # separate SQLite handles or change journal/connection configuration.
-        from app.db import Engine
-
-        connection = Engine.connect()
+        connection = get_engine().connect()
 
         class ReadConnection:
             def execute(self, sql, parameters=()):
@@ -310,16 +306,17 @@ class PtSubtitleFollowup(_PluginBase):
             return
         try:
             data = event.event_data or {}
-            context = data.get("context")
+            context = value(data, "context")
             torrent = value(context, "torrent_info")
             media = value(context, "media_info")
             if not torrent:
                 return
+            download_hash, downloader = value(data, "hash"), value(data, "downloader", "")
             result = self._enqueue(
-                data.get("hash"), value(torrent, "site"), value(torrent, "page_url"),
+                download_hash, value(torrent, "site"), value(torrent, "page_url"),
                 value(media, "title") or value(torrent, "title", "新下载"),
-                value(torrent, "title", ""), time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 60)),
-                data.get("downloader", ""),
+                value(torrent, "title", ""), download_added_date(download_hash, downloader, self._db),
+                downloader,
             )
             if not result["success"]:
                 logger.info("[PT字幕补全] " + result["message"])
@@ -331,7 +328,7 @@ class PtSubtitleFollowup(_PluginBase):
         if not self._enabled or self._stop.is_set():
             return
         data = event.event_data or {}
-        key = str(data.get("download_hash") or "").lower()
+        key = str(value(data, "download_hash") or "").lower()
         with self._lock:
             if key in self._tasks:
                 self._tasks[key]["revision"] = self._tasks[key].get("revision", 0) + 1
@@ -635,7 +632,7 @@ class PtSubtitleFollowup(_PluginBase):
 
     def get_api(self):
         from fastapi import Depends, Header, HTTPException
-        from app.db.user_oper import get_current_active_superuser
+        get_current_active_superuser = get_administrator_dependency()
         fusion_routes = [
             {"path": "/fusion/status", "endpoint": self._fusion.status, "methods": ["GET"], "summary": "观影画像状态"},
             {"path": "/fusion/validate", "endpoint": self._fusion.validate, "methods": ["POST"], "summary": "验证当前用户绑定"},
@@ -646,6 +643,12 @@ class PtSubtitleFollowup(_PluginBase):
         ]
         for route in fusion_routes:
             route.update(auth="bear", dependencies=[Depends(get_current_active_superuser)])
+            # Native V3 PageRender unwraps the host envelope. Vue owns its existing
+            # response contracts; parameterized endpoints and authorization stay unchanged.
+            if IS_V3 and self.get_render_mode()[0] == "vuetify" and route["path"] in {
+                    "/fusion/status", "/fusion/validate", "/fusion/refresh",
+                    "/fusion/candidates/status", "/fusion/candidates/refresh"}:
+                route["endpoint"] = native_page_action(route["endpoint"])
         def signed_in(authorization: str = Header(default="", alias="Authorization"),
                       current_user=Depends(get_current_active_superuser)):
             # The host also accepts a shared API key for bearer-mode routes.

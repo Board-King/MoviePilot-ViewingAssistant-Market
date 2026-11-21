@@ -1,4 +1,4 @@
-"""Build a MoviePilot V2 release from this checkout alone. Standard library only."""
+"""Build one verified MoviePilot V2/V3 release. Standard library only."""
 import argparse
 import ast
 import hashlib
@@ -11,6 +11,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 PID = "PtSubtitleFollowup"
 PLUGIN = ROOT / "plugins.v2" / PID.lower()
+V3_PLUGIN = ROOT / "plugins.v3" / PID.lower()
 ENTRY = "dist/assets/remoteEntry.js"
 QR = "assets/wechat-appreciation.jpg"
 QR_SHA = "6d4dc8e46531420a80d547e932aad910d5b0daf33edb8f12093e41b8a58e0ae1"
@@ -33,16 +34,52 @@ def render_frontend():
     )
 
 
-def package(tag=None):
-    entries = json.loads(source(ROOT / "package.v2.json"))
-    check(set(entries) == {PID}, "Unexpected plugin index")
-    listing = entries[PID]
+def release_listing():
+    listings = {}
+    for generation, host in (("v2", "2.15.6"), ("v3", "3.2.9")):
+        entries = json.loads(source(ROOT / f"package.{generation}.json"))
+        check(set(entries) == {PID}, f"Unexpected {generation} plugin index")
+        listing = entries[PID]
+        check(listing.get("release") is True and listing.get("system_version") == f"=={host}",
+              f"Review {generation} host compatibility before changing the release contract")
+        if generation == "v2":
+            check(listing.get("v3") is False, "V3 must use its own verified index")
+        else:
+            check(listing.get("v3") is not False and listing.get("v3t") is False,
+                  "Review V3 runtime compatibility before changing the release contract")
+        listings[generation] = listing
+    compatibility_fields = {"system_version", "v3", "v3t"}
+    shared = lambda listing: {key: value for key, value in listing.items() if key not in compatibility_fields}
+    check(shared(listings["v2"]) == shared(listings["v3"]), "V2 and V3 must publish the same release metadata")
+    return listings["v2"]
+
+
+def sync_v3_mirror(files, write=False):
+    """Keep the source-install fallback identical to the common release ZIP."""
+    check(V3_PLUGIN.resolve() == V3_PLUGIN, "Linked V3 mirror directory")
+    existing = {
+        path.relative_to(V3_PLUGIN).as_posix()
+        for path in V3_PLUGIN.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+    }
+    check(not (existing - files.keys()), "Unexpected file in generated V3 mirror")
+    for name, data in files.items():
+        path = V3_PLUGIN / name
+        check(path.resolve() == path, "Linked file in generated V3 mirror: " + name)
+        if write:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        check(path.is_file(), "Regenerate V3 source mirror with --write-v3: " + name)
+        mirrored = path.read_bytes() if name == QR else source(path)
+        check(mirrored == data, "Regenerate V3 source mirror with --write-v3: " + name)
+
+
+def package(tag=None, write_v3=False):
+    listing = release_listing()
     version = listing["version"]
     check(re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)",version), "Invalid version")
     expected_tag = f"{PID}_v{version}"
     check(not tag or tag == expected_tag, "Tag does not match version")
-    check(listing["release"] is True and listing["v3"] is False and listing["system_version"] == "==2.15.6",
-          "Review host compatibility before changing the release contract")
     check(listing.get("history", {}).get("v" + version), "Missing entry in version history")
     names = source(ROOT / "tools/package-files.txt").decode().splitlines()
     check(len(names) == len(set(names)) and ENTRY in names and QR in names, "Invalid package allowlist")
@@ -67,6 +104,7 @@ def package(tag=None):
                       ("plugin_icon","icon"),("plugin_author","author")):
         check(values.get(key) == listing[field], f"Mismatch between {key} and index")
     check((ROOT / "icons/viewing-assistant.png").is_file(), "Public listing icon missing")
+    sync_v3_mirror(files, write=write_v3)
     manifest_bytes = io.BytesIO()
     with zipfile.ZipFile(manifest_bytes,"w",compression=zipfile.ZIP_STORED) as archive:
         for name, data in sorted(files.items()):
@@ -84,11 +122,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag",help="Require this exact release tag")
     parser.add_argument("--write-ui",action="store_true",help="Rebuild the single Vue entry before packaging")
+    parser.add_argument("--write-v3",action="store_true",help="Regenerate V3 fallback sources from the canonical V2 source")
     parser.add_argument("--verify",action="store_true",help="Check existing dist bytes instead of writing")
     args = parser.parse_args()
+    check(not (args.verify and (args.write_ui or args.write_v3)), "Verification must not modify sources")
     if args.write_ui:
         (PLUGIN / ENTRY).write_bytes(render_frontend())
-    filename, payload, sums = package(args.tag)
+    filename, payload, sums = package(args.tag, write_v3=args.write_v3)
     out = ROOT / "dist"
     for name,data in ((filename,payload),("SHA256SUMS",sums)):
         if args.verify:

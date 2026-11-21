@@ -27,5 +27,6 @@ fusion/subtitle_ui.py
 fusion/tonight.py
 fusion/ui.py
 fusion/upcoming.py
+host_compat.py
 providers.py
 subtitle_files.py

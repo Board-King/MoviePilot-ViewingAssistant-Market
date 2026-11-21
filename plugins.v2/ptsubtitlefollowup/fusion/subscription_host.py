@@ -1,4 +1,4 @@
-"""MoviePilot v2.15.6 subscription boundary for TMDB movies and ordinary TV seasons.
+"""Reviewed MoviePilot subscription boundaries for TMDB movies and TV seasons.
 
 Read contracts: Emby /Features requires an administrator and /Items supports
 root recursive queries, AnyProviderIdEquals and HasTmdbId. Never query user
@@ -20,6 +20,7 @@ import unicodedata
 
 
 VERSION = "v2.15.6"
+V3_VERSION = "v3.2.9"
 MAX_SUBSCRIPTIONS = 2048
 MAX_SERVERS = 8
 _SOURCE_HASHES = {
@@ -27,6 +28,18 @@ _SOURCE_HASHES = {
     "app.db.subscribe_oper": "83c3c0f6d4a588a7a32b3fc67f343e89c8aa1545301c1553859316aa03bf9b2c",
     "app.db.models.subscribe": "efa92d87ca839f42e2f2c38f591dc0635c21ce93fe5cb5120cd0d261e694a67e",
 }
+_SOURCE_HASHES_BY_VERSION = {VERSION: _SOURCE_HASHES, V3_VERSION: {
+    "app.chain.subscribe": "c92ad9a45fcbed4619ec92d7fd108f8b98c2a439c7c2dd577c443665a06d8449",
+    "app.chain.subscribe.create": "3576cfac8747736d3c85b6f7466b94816536a43fa9a7dfddda6ca3e1f7fb58e8",
+    "app.chain.subscribe.facade": "638ae090211e8e8d5323ae7007bb75268466c00743336ba6815ce3ce1d229160",
+    "app.chain.subscribe.identity": "6be3ae81c9e76cf1698de832adab632a77936809e4cec2166005ec3f2eb2a741",
+    "app.chain.subscribe.query": "40f46bd9ef4f100097ad0f948c220d460b5308152ce5202094e0e92f4d0291c3",
+    "app.application.subscription.write": "2b6708cbdd6d1bd6d9d755ca9521229d2be7d739593c278825adf0b93cb35e00",
+    "app.db.adapters.subscription": "8c7d1d08e6fb4df32fcdf7434e91cb4a4e151b6b778d5a31847651d042c1c713",
+    "app.db.models.subscribe": "b6f3647e51fc307502cb35e42c7bff2d0661ff54e15fffff41c50e189ec18524",
+    "app.db.models.subscribehistory": "2c9d7aa379df98c14f4baaa96ee945850ea452eaa17ae9f885256edec40673f2",
+    "app.schemas.media": "c7f292ba6b8a6e4c790a89b077ff731f5fd431192430c955dba284b9c5b10253",
+}}
 
 
 def _tmdb(value):
@@ -69,7 +82,7 @@ def _permit(callback):
         raise _NotSent()
 
 
-def _existing(rows, identity, owner, *, external_ids=None):
+def _existing(rows, identity, owner, *, external_ids=None, unified=False):
     """Classify both canonical and legacy identities across all owners."""
     if len(rows) > MAX_SUBSCRIPTIONS:
         return {"status": "unknown", "sid": None}
@@ -77,6 +90,8 @@ def _existing(rows, identity, owner, *, external_ids=None):
     incomplete = False
     tv = identity["media_type"] == "tv"
     for row in rows:
+        if unified and row["type"] in ("电影", "电视剧", "音乐") and row["type"] != ("电视剧" if tv else "电影"):
+            continue  # V3's canonical identity explicitly includes media type.
         if tv:
             if row["type"] == "电影" and row["season"] is None:
                 continue  # TMDB series and movie IDs have independent namespaces.
@@ -115,7 +130,8 @@ def _existing(rows, identity, owner, *, external_ids=None):
             continue
         exact_season = type(row["season"]) is int and row["season"] == identity["season"] if tv else row["season"] is None
         exact_owner_row = (row["type"] == ("电视剧" if tv else "电影") and exact_season and row["episode_group"] is None
-                           and row["username"] == owner and row["best_version"] == 0
+                           and row["username"] == owner
+                           and (row["best_version"] == 0 or unified and row["best_version"] is None)
                            and tmdb_ids == {identity["media_id"]}
                            and provider in (None, "", "tmdb", "themoviedb")
                            and type(row["id"]) is int and row["id"] > 0)
@@ -187,14 +203,79 @@ class _ExactRecognition:
         return getattr(self.chain, name)
 
 
+class _V3WriteGuard:
+    """Check the translated request immediately before the V3 transaction."""
+
+    def __init__(self, receiver, repository, owner):
+        self.receiver, self.repository, self.owner = receiver, repository, owner
+
+    def __getattr__(self, name):
+        return getattr(self.repository, name)
+
+    def add(self, *, identity, payload, username=None, **kwargs):
+        receiver = self.receiver
+        expected = receiver.identity
+        values = payload.to_payload()
+        media_type = receiver.media_type.value
+        checks = {"media_source": "themoviedb", "media_id": expected["media_id"],
+                  "type": media_type, "season": expected["season"], "episode_group": None}
+        if (username != self.owner or values.get("username") != self.owner
+                or any(getattr(identity, key, None) != value or values.get(key) != value
+                       for key, value in checks.items())
+                or getattr(identity, "music_type", None) is not None
+                or values.get("music_type") is not None
+                or values.get("best_version") not in (None, False, 0)
+                or values.get("best_version_full") not in (None, False, 0)):
+            raise _NotSent("Native subscription payload mismatch")
+        _permit(receiver.may_dispatch)
+        receiver.past_guard = True
+        return self.repository.add(identity=identity, payload=payload, username=username, **kwargs)
+
+
+class _ExactRecognitionV3(_ExactRecognition):
+    """Keep V3's split creation helpers on this invocation, never the singleton."""
+
+    def __init__(self, chain, identity, media_type, may_dispatch, owner):
+        super().__init__(chain, identity, media_type, may_dispatch)
+        self.subscription_repository = _V3WriteGuard(self, chain.subscription_repository, owner)
+
+    def _check(self, media):
+        if (media is None or media.type != self.media_type
+                or media.media_source != "themoviedb" or media.media_id != self.identity["media_id"]
+                or getattr(media, "episode_group", None) is not None
+                or getattr(media, "tmdb_id", None) not in (None, int(self.identity["media_id"]))):
+            raise _NotSent("Native media identity mismatch")
+        return media
+
+    def _defaults(self, *args, **kwargs):
+        values = self.chain._SubscribeChain__get_default_kwargs(*args, **kwargs)
+        if (values.get("best_version") not in (None, False, 0)
+                or values.get("best_version_full") not in (None, False, 0)):
+            raise _NotSent("Default preset requests an upgrade")
+        return values
+
+    def __getattr__(self, name):
+        if name == "_SubscribeChain__get_default_kwargs":
+            return self._defaults
+        method = getattr(self.chain, name)
+        # A bound helper would otherwise execute with the original singleton,
+        # silently bypassing obtain_images and the guarded repository. Static
+        # helpers and post-commit event handlers keep their native binding.
+        if inspect.ismethod(method) and method.__func__.__module__ == "app.chain.subscribe.create":
+            return method.__func__.__get__(self, type(self))
+        return method
+
+
 class _MoviePilot:
     def __init__(self):
         from importlib import import_module
         from version import APP_VERSION
-        if APP_VERSION != VERSION:
+        if APP_VERSION not in _SOURCE_HASHES_BY_VERSION:
             raise ValueError("Unsupported host version")
-        modules = {name: import_module(name) for name in _SOURCE_HASHES}
-        for name, digest in _SOURCE_HASHES.items():
+        self.version = APP_VERSION
+        hashes = _SOURCE_HASHES_BY_VERSION[APP_VERSION]
+        modules = {name: import_module(name) for name in hashes}
+        for name, digest in hashes.items():
             source = Path(inspect.getsourcefile(modules[name]))
             if source.stat().st_size > 1024 * 1024 or hashlib.sha256(source.read_bytes()).hexdigest() != digest:
                 raise ValueError("Unsupported host source")
@@ -210,9 +291,14 @@ class _MoviePilot:
         self.movie_type, self.tv_type = MediaType.MOVIE, MediaType.TV
         add = self.chain_type.add
         parameters = inspect.signature(add).parameters
-        if (add.__module__ != "app.chain.subscribe" or add.__qualname__ != "SubscribeChain.add"
-                or not {"title", "year", "mtype", "media_source", "media_id", "tmdbid", "username",
-                        "season", "episode_group", "message", "kwargs"} <= parameters.keys()
+        v3 = self.version == V3_VERSION
+        required = {"title", "year", "mtype", "media_source", "media_id", "username",
+                    "season", "episode_group", "message", "kwargs"}
+        if not v3:
+            required.add("tmdbid")
+        if (add.__module__ != ("app.chain.subscribe.create" if v3 else "app.chain.subscribe")
+                or add.__qualname__ != ("SubscribeCreateOwner.add" if v3 else "SubscribeChain.add")
+                or not required <= parameters.keys()
                 or parameters["kwargs"].kind != inspect.Parameter.VAR_KEYWORD):
             raise ValueError("Unsupported native add")
         self.native_add = add
@@ -238,14 +324,20 @@ class _MoviePilot:
     def subscriptions(self, history=False):
         sub = self.history if history else self.subscribe
         with self.engine.connect() as connection:
-            statement = self.select(sub.id, sub.username, sub.type, sub.media_source, sub.media_id,
-                                    sub.mediaid, sub.tmdbid, sub.doubanid, sub.season, sub.episode_group,
-                                    sub.best_version).limit(MAX_SUBSCRIPTIONS + 1)
-            return connection.execute(statement).mappings().all()
+            fields = [sub.id, sub.username, sub.type, sub.media_source, sub.media_id,
+                      sub.season, sub.episode_group, sub.best_version]
+            if self.version == VERSION:
+                fields.extend((sub.mediaid, sub.tmdbid, sub.doubanid))
+            rows = connection.execute(self.select(*fields).limit(MAX_SUBSCRIPTIONS + 1)).mappings().all()
+            return [{"mediaid": None, "tmdbid": None, "doubanid": None, **row} for row in rows]
 
     @staticmethod
     def _detail(kind, media_id):
-        from app.core.config import settings
+        from version import APP_VERSION
+        if APP_VERSION == V3_VERSION:
+            from app.sdk.config import settings
+        else:
+            from app.core.config import settings
         from .sources import TmdbSourceClient
         config = {"api_key": settings.TMDB_API_KEY, "proxies": settings.PROXY if settings.PROXY_HOST else None}
         with TmdbSourceClient(config, deadline_seconds=10) as client:
@@ -275,12 +367,15 @@ class _MoviePilot:
                 raise _NotSent("Aired season changed or unconfirmed")
             media_type = self.tv_type
             _permit(may_dispatch)
-        receiver = _ExactRecognition(self.chain_type(), identity, media_type, may_dispatch)
+        v3 = getattr(self, "version", VERSION) == V3_VERSION
+        receiver = (_ExactRecognitionV3(self.chain_type(), identity, media_type, may_dispatch, owner) if v3
+                    else _ExactRecognition(self.chain_type(), identity, media_type, may_dispatch))
+        legacy_args = {} if v3 else {"tmdbid": int(identity["media_id"])}
         try:
             return self.native_add(receiver, title=identity["title"], year=str(identity["year"] or ""),
                                    mtype=media_type, media_source="themoviedb", media_id=identity["media_id"],
-                                   tmdbid=int(identity["media_id"]), season=identity["season"], episode_group=None,
-                                   username=owner, owner_scope=True, message=False)
+                                   season=identity["season"], episode_group=None,
+                                   username=owner, owner_scope=True, message=False, **legacy_args)
         except _NotSent:
             if receiver.past_guard:
                 raise RuntimeError("Native persistence outcome unknown") from None
@@ -489,7 +584,7 @@ class HostSubscriptionAdapter:
         if _owner_name(owner):
             try:
                 host = self._native()
-                result["version"] = VERSION
+                result["version"] = getattr(host, "version", VERSION)
                 owner_key, host_key = host.owner_context(owner)
                 result.update(ready=True, owner_key=owner_key, host_key=host_key)
             except Exception:
@@ -501,10 +596,11 @@ class HostSubscriptionAdapter:
             try:
                 host = self._native()
                 external = self._external_ids if indexed_only else None
-                current = _existing(host.subscriptions(), identity, owner, external_ids=external)
+                unified = getattr(host, "version", VERSION) == V3_VERSION
+                current = _existing(host.subscriptions(), identity, owner, external_ids=external, unified=unified)
                 if current["status"] != "absent":
                     return current
-                history = _existing(host.subscriptions(history=True), identity, owner, external_ids=external)
+                history = _existing(host.subscriptions(history=True), identity, owner, external_ids=external, unified=unified)
                 if history["status"] in {"existing", "conflict"}:
                     return {"status": "conflict", "sid": None}
                 return history

@@ -1,0 +1,678 @@
+"""Reviewed MoviePilot subscription boundaries for TMDB movies and TV seasons.
+
+Read contracts: Emby /Features requires an administrator and /Items supports
+root recursive queries, AnyProviderIdEquals and HasTmdbId. Never query user
+watch data. A native add can synchronously emit SubscribeAdded, even when MP
+returns an existing SID, and MP may subsequently search a new subscription.
+The caller owns authorization, reservations and reconciliation across writers.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from functools import lru_cache
+import hashlib
+import inspect
+import json
+from pathlib import Path
+import re
+import time
+import unicodedata
+
+
+VERSION = "v2.15.6"
+V3_VERSION = "v3.2.9"
+MAX_SUBSCRIPTIONS = 2048
+MAX_SERVERS = 8
+_SOURCE_HASHES = {
+    "app.chain.subscribe": "acb32d818b2cb8bf8dec3062e1b9155595b2045b8de08aa7db3005f6d48b0f95",
+    "app.db.subscribe_oper": "83c3c0f6d4a588a7a32b3fc67f343e89c8aa1545301c1553859316aa03bf9b2c",
+    "app.db.models.subscribe": "efa92d87ca839f42e2f2c38f591dc0635c21ce93fe5cb5120cd0d261e694a67e",
+}
+_SOURCE_HASHES_BY_VERSION = {VERSION: _SOURCE_HASHES, V3_VERSION: {
+    "app.chain.subscribe": "c92ad9a45fcbed4619ec92d7fd108f8b98c2a439c7c2dd577c443665a06d8449",
+    "app.chain.subscribe.create": "3576cfac8747736d3c85b6f7466b94816536a43fa9a7dfddda6ca3e1f7fb58e8",
+    "app.chain.subscribe.facade": "638ae090211e8e8d5323ae7007bb75268466c00743336ba6815ce3ce1d229160",
+    "app.chain.subscribe.identity": "6be3ae81c9e76cf1698de832adab632a77936809e4cec2166005ec3f2eb2a741",
+    "app.chain.subscribe.query": "40f46bd9ef4f100097ad0f948c220d460b5308152ce5202094e0e92f4d0291c3",
+    "app.application.subscription.write": "2b6708cbdd6d1bd6d9d755ca9521229d2be7d739593c278825adf0b93cb35e00",
+    "app.db.adapters.subscription": "8c7d1d08e6fb4df32fcdf7434e91cb4a4e151b6b778d5a31847651d042c1c713",
+    "app.db.models.subscribe": "b6f3647e51fc307502cb35e42c7bff2d0661ff54e15fffff41c50e189ec18524",
+    "app.db.models.subscribehistory": "2c9d7aa379df98c14f4baaa96ee945850ea452eaa17ae9f885256edec40673f2",
+    "app.schemas.media": "c7f292ba6b8a6e4c790a89b077ff731f5fd431192430c955dba284b9c5b10253",
+}}
+
+
+def _tmdb(value):
+    if type(value) is int:
+        value = str(value)
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,17}", value):
+        return value
+    return None
+
+
+def _supported(identity):
+    if not isinstance(identity, Mapping):
+        return False
+    title, year = identity.get("title"), identity.get("year")
+    kind, season = identity.get("media_type"), identity.get("season")
+    valid_target = ((kind == "movie" and season is None)
+                    or (kind == "tv" and type(season) is int and 1 <= season <= 99))
+    return (identity.get("provider") == "themoviedb" and valid_target
+            and isinstance(identity.get("media_id"), str) and _tmdb(identity["media_id"]) is not None
+            and identity.get("episode_group") is None
+            and isinstance(title, str) and bool(title.strip()) and len(title) <= 240 and title.isprintable()
+            and (year is None or type(year) is int and 1800 <= year <= 2200))
+
+
+def _owner_name(owner):
+    return (isinstance(owner, str) and bool(owner) and owner == owner.strip()
+            and len(owner) <= 128 and owner.isprintable())
+
+
+class _NotSent(Exception):
+    """This call stopped strictly before native subscription persistence."""
+
+
+def _permit(callback):
+    try:
+        allowed = callable(callback) and callback() is True
+    except Exception:
+        allowed = False
+    if not allowed:
+        raise _NotSent()
+
+
+def _existing(rows, identity, owner, *, external_ids=None, unified=False):
+    """Classify both canonical and legacy identities across all owners."""
+    if len(rows) > MAX_SUBSCRIPTIONS:
+        return {"status": "unknown", "sid": None}
+    matches = []
+    incomplete = False
+    tv = identity["media_type"] == "tv"
+    for row in rows:
+        if unified and row["type"] in ("电影", "电视剧", "音乐") and row["type"] != ("电视剧" if tv else "电影"):
+            continue  # V3's canonical identity explicitly includes media type.
+        if tv:
+            if row["type"] == "电影" and row["season"] is None:
+                continue  # TMDB series and movie IDs have independent namespaces.
+            if (row["type"] == "电视剧" and row["episode_group"] is None
+                    and type(row["season"]) is int and row["season"] >= 0 and row["season"] != identity["season"]):
+                continue
+        tmdb_ids = set()
+        provider, media_id = row["media_source"], row["media_id"]
+        if provider in ("themoviedb", "tmdb"):
+            tmdb_ids.add(_tmdb(media_id))
+        if row["tmdbid"] is not None:
+            tmdb_ids.add(_tmdb(row["tmdbid"]))
+        legacy_key = row["mediaid"]
+        if isinstance(legacy_key, str) and legacy_key.startswith(("tmdb:", "themoviedb:")):
+            tmdb_ids.add(_tmdb(legacy_key.split(":", 1)[1]))
+        if identity["media_id"] not in tmdb_ids:
+            # Compare in Douban's own namespace only when the movie and its
+            # exact IMDb cross-reference are both known; never search by name.
+            if not tv and not tmdb_ids and provider == "douban" and row["type"] == "电影" and external_ids:
+                douban_id = _tmdb(media_id)
+                aliases = [row.get("doubanid")]
+                if legacy_key:
+                    aliases.append(legacy_key.removeprefix("douban:") if isinstance(legacy_key, str)
+                                   and legacy_key.startswith("douban:") else False)
+                if douban_id and all(value in (None, "") or _tmdb(value) == douban_id for value in aliases):
+                    candidate_douban = external_ids(identity["media_id"]).get("douban")
+                    if candidate_douban == douban_id:
+                        return {"status": "conflict", "sid": None}
+                    if _tmdb(candidate_douban):
+                        continue
+            # An unmapped movie may already represent the request on a different
+            # provider. An explicit TV row with no matching key cannot own it.
+            relevant = tv or row["type"] != "电视剧"
+            if relevant and (not tmdb_ids or None in tmdb_ids or len(tmdb_ids) != 1):
+                incomplete = True
+            continue
+        exact_season = type(row["season"]) is int and row["season"] == identity["season"] if tv else row["season"] is None
+        exact_owner_row = (row["type"] == ("电视剧" if tv else "电影") and exact_season and row["episode_group"] is None
+                           and row["username"] == owner
+                           and (row["best_version"] == 0 or unified and row["best_version"] is None)
+                           and tmdb_ids == {identity["media_id"]}
+                           and provider in (None, "", "tmdb", "themoviedb")
+                           and type(row["id"]) is int and row["id"] > 0)
+        if not exact_owner_row:
+            return {"status": "conflict", "sid": None}
+        matches.append(row["id"])
+    if len(matches) > 1:
+        return {"status": "conflict", "sid": None}
+    if matches:
+        return {"status": "existing", "sid": matches[0]}
+    return {"status": "unknown" if incomplete else "absent", "sid": None}
+
+
+def _douban_movie_id(result):
+    if not isinstance(result, dict):
+        return None
+    value = result.get("id")
+    if _tmdb(value):
+        return _tmdb(value)
+    match = re.fullmatch(r"https://api\.douban\.com/movie/([1-9][0-9]{0,17})/?", value) if isinstance(value, str) else None
+    return match.group(1) if match else None
+
+
+class _ExactRecognition:
+    """One call's receiver for the pinned native method; no singleton edits."""
+
+    def __init__(self, chain, identity, media_type, may_dispatch):
+        self.chain, self.identity, self.media_type = chain, identity, media_type
+        self.may_dispatch = may_dispatch
+        self.past_guard = False
+
+    def _check(self, media):
+        if (media is None or media.type != self.media_type or media.source != "themoviedb"
+                or _tmdb(media.tmdb_id) != self.identity["media_id"]
+                or getattr(media, "media_id", None) not in (None, "", self.identity["media_id"],
+                                                            int(self.identity["media_id"]))
+                or getattr(media, "episode_group", None) is not None):
+            raise _NotSent("Native media identity mismatch")
+        return media
+
+    def recognize_media(self, **kwargs):
+        # Raising here prevents SubscribeChain.add's same-provider title fallback.
+        _permit(self.may_dispatch)
+        return self._check(self.chain.recognize_media(**kwargs))
+
+    def obtain_images(self, *, mediainfo):
+        if self.identity["media_type"] == "tv":
+            seasons = getattr(mediainfo, "seasons", None)
+            episodes = seasons.get(self.identity["season"]) if isinstance(seasons, dict) else None
+            if (not isinstance(episodes, list) or not episodes
+                    or not all(type(number) is int and number > 0 for number in episodes)):
+                raise _NotSent("Native season missing")
+        result = self.chain.obtain_images(mediainfo=mediainfo)
+        self._check(mediainfo)
+        return result
+
+    def _defaults(self, *args, **kwargs):
+        values = self.chain._SubscribeChain__get_default_kwargs(*args, **kwargs)
+        if values.get("best_version") not in (None, False, 0):
+            raise _NotSent("Default preset requests an upgrade")
+        # In the pinned add body the very next operation is SubscribeOper.add.
+        _permit(self.may_dispatch)
+        self.past_guard = True
+        return values
+
+    def __getattr__(self, name):
+        if name == "_SubscribeChain__get_default_kwargs":
+            return self._defaults
+        return getattr(self.chain, name)
+
+
+class _V3WriteGuard:
+    """Check the translated request immediately before the V3 transaction."""
+
+    def __init__(self, receiver, repository, owner):
+        self.receiver, self.repository, self.owner = receiver, repository, owner
+
+    def __getattr__(self, name):
+        return getattr(self.repository, name)
+
+    def add(self, *, identity, payload, username=None, **kwargs):
+        receiver = self.receiver
+        expected = receiver.identity
+        values = payload.to_payload()
+        media_type = receiver.media_type.value
+        checks = {"media_source": "themoviedb", "media_id": expected["media_id"],
+                  "type": media_type, "season": expected["season"], "episode_group": None}
+        if (username != self.owner or values.get("username") != self.owner
+                or any(getattr(identity, key, None) != value or values.get(key) != value
+                       for key, value in checks.items())
+                or getattr(identity, "music_type", None) is not None
+                or values.get("music_type") is not None
+                or values.get("best_version") not in (None, False, 0)
+                or values.get("best_version_full") not in (None, False, 0)):
+            raise _NotSent("Native subscription payload mismatch")
+        _permit(receiver.may_dispatch)
+        receiver.past_guard = True
+        return self.repository.add(identity=identity, payload=payload, username=username, **kwargs)
+
+
+class _ExactRecognitionV3(_ExactRecognition):
+    """Keep V3's split creation helpers on this invocation, never the singleton."""
+
+    def __init__(self, chain, identity, media_type, may_dispatch, owner):
+        super().__init__(chain, identity, media_type, may_dispatch)
+        self.subscription_repository = _V3WriteGuard(self, chain.subscription_repository, owner)
+
+    def _check(self, media):
+        if (media is None or media.type != self.media_type
+                or media.media_source != "themoviedb" or media.media_id != self.identity["media_id"]
+                or getattr(media, "episode_group", None) is not None
+                or getattr(media, "tmdb_id", None) not in (None, int(self.identity["media_id"]))):
+            raise _NotSent("Native media identity mismatch")
+        return media
+
+    def _defaults(self, *args, **kwargs):
+        values = self.chain._SubscribeChain__get_default_kwargs(*args, **kwargs)
+        if (values.get("best_version") not in (None, False, 0)
+                or values.get("best_version_full") not in (None, False, 0)):
+            raise _NotSent("Default preset requests an upgrade")
+        return values
+
+    def __getattr__(self, name):
+        if name == "_SubscribeChain__get_default_kwargs":
+            return self._defaults
+        method = getattr(self.chain, name)
+        # A bound helper would otherwise execute with the original singleton,
+        # silently bypassing obtain_images and the guarded repository. Static
+        # helpers and post-commit event handlers keep their native binding.
+        if inspect.ismethod(method) and method.__func__.__module__ == "app.chain.subscribe.create":
+            return method.__func__.__get__(self, type(self))
+        return method
+
+
+class _MoviePilot:
+    def __init__(self):
+        from importlib import import_module
+        from version import APP_VERSION
+        if APP_VERSION not in _SOURCE_HASHES_BY_VERSION:
+            raise ValueError("Unsupported host version")
+        self.version = APP_VERSION
+        hashes = _SOURCE_HASHES_BY_VERSION[APP_VERSION]
+        modules = {name: import_module(name) for name in hashes}
+        for name, digest in hashes.items():
+            source = Path(inspect.getsourcefile(modules[name]))
+            if source.stat().st_size > 1024 * 1024 or hashlib.sha256(source.read_bytes()).hexdigest() != digest:
+                raise ValueError("Unsupported host source")
+        from app.db import Engine
+        from app.db.models.user import User
+        from app.db.models.subscribehistory import SubscribeHistory
+        from app.schemas.types import MediaType
+        from sqlalchemy import select
+        self.engine, self.user, self.select = Engine, User, select
+        self.subscribe = modules["app.db.models.subscribe"].Subscribe
+        self.history = SubscribeHistory
+        self.chain_type = modules["app.chain.subscribe"].SubscribeChain
+        self.movie_type, self.tv_type = MediaType.MOVIE, MediaType.TV
+        add = self.chain_type.add
+        parameters = inspect.signature(add).parameters
+        v3 = self.version == V3_VERSION
+        required = {"title", "year", "mtype", "media_source", "media_id", "username",
+                    "season", "episode_group", "message", "kwargs"}
+        if not v3:
+            required.add("tmdbid")
+        if (add.__module__ != ("app.chain.subscribe.create" if v3 else "app.chain.subscribe")
+                or add.__qualname__ != ("SubscribeCreateOwner.add" if v3 else "SubscribeChain.add")
+                or not required <= parameters.keys()
+                or parameters["kwargs"].kind != inspect.Parameter.VAR_KEYWORD):
+            raise ValueError("Unsupported native add")
+        self.native_add = add
+
+    def owner_context(self, owner):
+        # SQLite file replacement is a new host scope, even at the same path.
+        if self.engine.dialect.name != "sqlite" or not self.engine.url.database:
+            raise ValueError("Unsupported database scope")
+        database = Path(self.engine.url.database).resolve(strict=True)
+        stat = database.stat()
+        if not database.is_file() or stat.st_ino <= 0:
+            raise ValueError("Database identity unavailable")
+        host_key = hashlib.sha256(f"{database}|{stat.st_dev}|{stat.st_ino}".encode()).hexdigest()
+        user = self.user
+        with self.engine.connect() as connection:
+            rows = connection.execute(self.select(user.id, user.name, user.is_active)
+                                      .where(user.name == owner).limit(2)).mappings().all()
+        if (len(rows) != 1 or rows[0]["name"] != owner or rows[0]["is_active"] is not True
+                or type(rows[0]["id"]) is not int or rows[0]["id"] <= 0):
+            raise ValueError("Active owner unavailable")
+        return str(rows[0]["id"]), host_key
+
+    def subscriptions(self, history=False):
+        sub = self.history if history else self.subscribe
+        with self.engine.connect() as connection:
+            fields = [sub.id, sub.username, sub.type, sub.media_source, sub.media_id,
+                      sub.season, sub.episode_group, sub.best_version]
+            if self.version == VERSION:
+                fields.extend((sub.mediaid, sub.tmdbid, sub.doubanid))
+            rows = connection.execute(self.select(*fields).limit(MAX_SUBSCRIPTIONS + 1)).mappings().all()
+            return [{"mediaid": None, "tmdbid": None, "doubanid": None, **row} for row in rows]
+
+    @staticmethod
+    def _detail(kind, media_id):
+        from version import APP_VERSION
+        if APP_VERSION == V3_VERSION:
+            from app.sdk.config import settings
+        else:
+            from app.core.config import settings
+        from .sources import TmdbSourceClient
+        config = {"api_key": settings.TMDB_API_KEY, "proxies": settings.PROXY if settings.PROXY_HOST else None}
+        with TmdbSourceClient(config, deadline_seconds=10) as client:
+            return client.display_detail(kind, media_id)
+
+    def external_ids(self, media_id):
+        from app.modules.douban.apiv2 import DoubanApi
+        detail = self._detail("movie", media_id)
+        imdb = detail.get("imdb_id")
+        if _tmdb(detail.get("id")) != media_id or not isinstance(imdb, str) or not re.fullmatch(r"tt[0-9]{7,12}", imdb):
+            return {}
+        # This native endpoint accepts only an IMDb ID. Higher-level MP search
+        # APIs silently fall back to a fuzzy title match when no ID is found.
+        douban = _douban_movie_id(DoubanApi().imdbid(imdb))
+        return {"imdb": imdb, "douban": douban}
+
+    def add(self, identity, owner, may_dispatch):
+        _permit(may_dispatch)
+        media_type = self.movie_type
+        if identity["media_type"] == "tv":
+            from .series_subscription import latest_aired_season
+            try:
+                current = latest_aired_season(self._detail("tv", identity["media_id"]), identity["media_id"])
+            except Exception:
+                raise _NotSent("Series metadata unavailable") from None
+            if current != identity["season"]:
+                raise _NotSent("Aired season changed or unconfirmed")
+            media_type = self.tv_type
+            _permit(may_dispatch)
+        v3 = getattr(self, "version", VERSION) == V3_VERSION
+        receiver = (_ExactRecognitionV3(self.chain_type(), identity, media_type, may_dispatch, owner) if v3
+                    else _ExactRecognition(self.chain_type(), identity, media_type, may_dispatch))
+        legacy_args = {} if v3 else {"tmdbid": int(identity["media_id"])}
+        try:
+            return self.native_add(receiver, title=identity["title"], year=str(identity["year"] or ""),
+                                   mtype=media_type, media_source="themoviedb", media_id=identity["media_id"],
+                                   season=identity["season"], episode_group=None,
+                                   username=owner, owner_scope=True, message=False, **legacy_args)
+        except _NotSent:
+            if receiver.past_guard:
+                raise RuntimeError("Native persistence outcome unknown") from None
+            raise
+
+
+@lru_cache(maxsize=1)
+def _verified_host():
+    return _MoviePilot()
+
+
+def _query_result(response):
+    if not isinstance(response, dict):
+        raise ValueError("Invalid item query")
+    count, items = response.get("TotalRecordCount"), response.get("Items")
+    if (type(count) is not int or count < 0 or not isinstance(items, list)
+            or len(items) != min(count, 1) or items and not isinstance(items[0], dict)):
+        raise ValueError("Incomplete item query")
+    return items
+
+
+def _title_key(value):
+    if not isinstance(value, str) or len(value) > 512:
+        return ""
+    return "".join(c for c in unicodedata.normalize("NFKC", value).casefold() if c.isalnum())
+
+
+def _unidentified_movies(get, query, first):
+    """Only cache complete bounded reads, without paths, user data or playback history."""
+    records = []
+    count = first.get("TotalRecordCount")
+    if type(count) is not int or not 0 <= count <= 512:
+        raise ValueError("Unidentified movie inventory exceeded bounds")
+    seen = set()
+    page = first
+    while True:
+        rows = page.get("Items")
+        if (page.get("TotalRecordCount") != count or not isinstance(rows, list)
+                or len(rows) != min(128, count - len(records))):
+            raise ValueError("Incomplete unidentified movie inventory")
+        for row in rows:
+            if not isinstance(row, dict) or row.get("Type") != "Movie" or not isinstance(row.get("ProviderIds"), dict):
+                raise ValueError("Invalid movie record")
+            key = row.get("Id")
+            if (not isinstance(key, str) or not key or key in seen
+                    or any(str(k).casefold() == "tmdb" for k in row["ProviderIds"])):
+                raise ValueError("Unstable or unfiltered movie inventory")
+            seen.add(key)
+            names = frozenset(filter(None, (_title_key(row.get("Name")), _title_key(row.get("OriginalTitle")))))
+            year = row.get("ProductionYear")
+            records.append((names, year if type(year) is int and 1800 <= year <= 2200 else None))
+        if len(records) == count:
+            return records
+        page = get("/Items", {**query, "StartIndex": len(records)})
+
+
+def _unidentified_match(records, identity):
+    if not records:
+        return "absent"
+    name, year = _title_key(identity["title"]), identity.get("year")
+    for names, record_year in records:
+        year_overlaps = year is None or record_year is None or abs(year - record_year) <= 1
+        if not year_overlaps:
+            continue
+        if not name or not names or name in names:
+            return "unknown"
+        if any(min(len(name), len(label)) >= 4 and (name in label or label in name) for label in names):
+            return "unknown"
+    return "no_known_match"
+
+
+def _emby_season(get, identity, query):
+    """A series container or a different season is insufficient evidence of ownership."""
+    media_id, season = identity["media_id"], identity["season"]
+    shows = get("/Items", {**query, "IncludeItemTypes": "Series", "AnyProviderIdEquals": "tmdb." + media_id,
+                           "Limit": 8})
+    items, total = shows.get("Items"), shows.get("TotalRecordCount")
+    if (type(total) is not int or not 0 <= total <= 8 or not isinstance(items, list) or len(items) != total):
+        return "unknown"
+    seen_shows = set()
+    for show in items:
+        if not isinstance(show, dict):
+            return "unknown"
+        providers, show_id = show.get("ProviderIds"), show.get("Id")
+        if (show.get("Type") != "Series" or not isinstance(providers, dict)
+                or {_tmdb(v) for k, v in providers.items() if k.casefold() == "tmdb"} != {media_id}
+                or not isinstance(show_id, str) or not re.fullmatch(r"[0-9a-zA-Z-]{1,128}", show_id)
+                or show_id in seen_shows):
+            return "unknown"
+        seen_shows.add(show_id)
+        children = {**query, "ParentId": show_id, "IncludeItemTypes": "Episode", "IsPlaceHolder": "false"}
+        hits = _query_result(get("/Items", {**children, "ParentIndexNumber": season}))
+        if hits:
+            item = hits[0]
+            if (item.get("Type") == "Episode" and item.get("SeriesId") == show_id
+                    and type(item.get("ParentIndexNumber")) is int and item["ParentIndexNumber"] == season
+                    and type(item.get("IndexNumber")) is int and item["IndexNumber"] > 0
+                    and item.get("LocationType") != "Virtual" and item.get("IsPlaceHolder") is not True):
+                return "present"
+            return "unknown"
+        # Missing index numbers can hide episodes from the filtered lookup. Prove
+        # that each child is from a different numbered season before allowing a write.
+        seen_episodes = set()
+        expected = None
+        while True:
+            page = get("/Items", {**children, "SortBy": "SortName", "Limit": 128, "StartIndex": len(seen_episodes)})
+            count, rows = page.get("TotalRecordCount"), page.get("Items")
+            if (type(count) is not int or not 0 <= count <= 512
+                    or (expected is not None and count != expected) or not isinstance(rows, list)
+                    or len(rows) != min(128, count - len(seen_episodes))):
+                return "unknown"
+            expected = count
+            for item in rows:
+                if not isinstance(item, dict):
+                    return "unknown"
+                key, number = item.get("Id"), item.get("ParentIndexNumber")
+                if (item.get("Type") != "Episode" or item.get("SeriesId") != show_id or not isinstance(key, str)
+                        or not key or key in seen_episodes or type(number) is not int or number < 0 or number == season):
+                    return "unknown"
+                seen_episodes.add(key)
+            if len(seen_episodes) == count:
+                break
+    # Shows lacking a TMDB mapping could be another copy of the same season.
+    gaps = _query_result(get("/Items", {**query, "IncludeItemTypes": "Series", "HasTmdbId": "false"}))
+    return "unknown" if gaps else "absent"
+
+
+def _emby_library(config, identity, deadline, indexed_only, gap_cache):
+    import requests
+    from .emby import _base_url
+    base, token = _base_url(config.get("host")), config.get("apikey")
+    if not isinstance(token, str) or not re.fullmatch(r"[!-~]{1,4096}", token):
+        raise ValueError("Invalid server credentials")
+    with requests.Session() as session:
+        session.trust_env = False
+        session.headers.update({"X-Emby-Token": token, "Accept": "application/json", "Accept-Encoding": "identity"})
+
+        def get(path, params):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("Library lookup expired")
+            session.cookies.clear()
+            with session.get(base + path, params=params, allow_redirects=False, stream=True, verify=True,
+                             timeout=(min(3, remaining), min(5, remaining))) as response:
+                if (response.status_code != 200 or response.headers.get("Content-Encoding", "identity") != "identity"
+                        or response.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json"):
+                    raise ValueError("Library lookup unavailable")
+                data = bytearray()
+                for chunk in response.iter_content(16384):
+                    if len(data) + len(chunk) > 256 * 1024 or time.monotonic() >= deadline:
+                        raise ValueError("Library response exceeded bounds")
+                    data.extend(chunk)
+                return json.loads(data.decode("utf-8-sig"))
+
+        # This admin-only endpoint exposes feature names, not keys or user
+        # activity. A regular profile token must never establish global absence.
+        features = get("/Features", {})
+        if (not isinstance(features, list) or not features or len(features) > 512
+                or not all(isinstance(value, dict) and isinstance(value.get("Id"), str) for value in features)):
+            return "unknown"
+        query = {"Recursive": "true", "IncludeItemTypes": "Movie", "Fields": "ProviderIds",
+                 "EnableUserData": "false", "EnableImages": "false", "Limit": 1, "StartIndex": 0}
+        if identity["media_type"] == "tv":
+            return _emby_season(get, identity, query)
+        media_id = identity["media_id"]
+        hits = _query_result(get("/Items", {**query, "AnyProviderIdEquals": "tmdb." + media_id}))
+        if hits:
+            item = hits[0]
+            providers = item.get("ProviderIds")
+            if (item.get("Type") != "Movie" or not isinstance(providers, dict)
+                    or {_tmdb(value) for key, value in providers.items() if key.casefold() == "tmdb"} != {media_id}
+                    or item.get("LocationType") == "Virtual"):
+                return "unknown"
+            return "present"
+        # A negative ID query alone misses movies with incomplete metadata.
+        gap_query = {**query, "HasTmdbId": "false"}
+        if not indexed_only:
+            return "unknown" if _query_result(get("/Items", gap_query)) else "absent"
+        # A rank-based grant may use identified movies, while similar unindexed
+        # records still block dispatch. This result is distinct from full absence.
+        cache_key = hashlib.sha256((base + "\0" + token).encode()).digest()
+        expiry, records = gap_cache.get(cache_key, (0, ()))
+        if expiry <= time.monotonic():
+            gap_query.update(Fields="ProviderIds,OriginalTitle,ProductionYear", Limit=128, SortBy="SortName")
+            records = _unidentified_movies(get, gap_query, get("/Items", gap_query))
+            if len(gap_cache) >= MAX_SERVERS:
+                gap_cache.clear()
+            gap_cache[cache_key] = (time.monotonic() + 15, records)
+        return _unidentified_match(records, identity)
+
+
+class HostSubscriptionAdapter:
+    def __init__(self, server_supplier, *, native_factory=_verified_host, library_probe=_emby_library):
+        self._servers, self._native, self._probe = server_supplier, native_factory, library_probe
+        self._gap_cache = {}
+        self._external_ids = lru_cache(maxsize=8)(self._read_external_ids)
+
+    def _read_external_ids(self, media_id):
+        try:
+            return self._native().external_ids(media_id)
+        except Exception:
+            return {}
+
+    def compatibility(self, owner):
+        result = {"ready": False, "version": "", "owner_key": "", "host_key": ""}
+        if _owner_name(owner):
+            try:
+                host = self._native()
+                result["version"] = getattr(host, "version", VERSION)
+                owner_key, host_key = host.owner_context(owner)
+                result.update(ready=True, owner_key=owner_key, host_key=host_key)
+            except Exception:
+                pass
+        return result
+
+    def lookup_subscription(self, identity, owner, *, indexed_only=False):
+        if _supported(identity) and self.compatibility(owner)["ready"]:
+            try:
+                host = self._native()
+                external = self._external_ids if indexed_only else None
+                unified = getattr(host, "version", VERSION) == V3_VERSION
+                current = _existing(host.subscriptions(), identity, owner, external_ids=external, unified=unified)
+                if current["status"] != "absent":
+                    return current
+                history = _existing(host.subscriptions(history=True), identity, owner, external_ids=external, unified=unified)
+                if history["status"] in {"existing", "conflict"}:
+                    return {"status": "conflict", "sid": None}
+                return history
+            except Exception:
+                pass
+        return {"status": "unknown", "sid": None}
+
+    def lookup_library(self, identity, *, indexed_only=False, fresh=False):
+        if not _supported(identity):
+            return "unknown"
+        try:
+            servers = self._servers()
+            if not isinstance(servers, list) or not 1 <= len(servers) <= MAX_SERVERS:
+                return "unknown"
+            statuses = []
+            deadline = time.monotonic() + 20
+            for server in servers:
+                if (not isinstance(server, dict) or server.get("enabled") is not True
+                        or str(server.get("type", "")).casefold() != "emby"
+                        or not isinstance(server.get("config"), dict) or time.monotonic() >= deadline):
+                    statuses.append("unknown")
+                    continue
+                try:
+                    status = self._probe(server["config"], identity, deadline, indexed_only is True,
+                                         {} if fresh else self._gap_cache)
+                except Exception:
+                    status = "unknown"
+                if status == "present":
+                    return "present"
+                statuses.append(status)
+            if all(status == "absent" for status in statuses):
+                return "absent"
+            if (identity["media_type"] == "movie" and indexed_only is True
+                    and all(status in ("absent", "no_known_match") for status in statuses)):
+                return "no_known_match"
+            return "unknown"
+        except Exception:
+            return "unknown"
+
+    def add(self, identity, owner, *, may_dispatch=None, indexed_only=False):
+        """One native call at most. Anything ambiguous requires reconciliation."""
+        unknown = {"kind": "unknown", "sid": None}
+        not_sent = {"kind": "not_sent", "sid": None}
+        try:
+            _permit(may_dispatch)
+        except _NotSent:
+            return not_sent
+        initial = self.compatibility(owner)
+        if not initial["ready"] or not _supported(identity):
+            return not_sent
+        before = self.lookup_subscription(identity, owner, indexed_only=indexed_only)
+        if before["status"] == "existing":
+            return {"kind": "existing", "sid": before["sid"]}
+        if before["status"] != "absent":
+            return not_sent
+        library = self.lookup_library(identity, indexed_only=indexed_only, fresh=True)
+        if library != "absent" and not (identity["media_type"] == "movie" and indexed_only is True
+                                        and library == "no_known_match"):
+            return not_sent
+        try:
+            if self.compatibility(owner) != initial or self.lookup_subscription(identity, owner, indexed_only=indexed_only)["status"] != "absent":
+                return not_sent
+            _permit(may_dispatch)
+            sid, message = self._native().add(identity, owner, may_dispatch)
+            if type(sid) is not int or sid <= 0:
+                return unknown
+            kind = {"新增订阅成功": "added", "订阅已存在": "existing"}.get(message)
+            if (kind is None or self.compatibility(owner) != initial
+                    or self.lookup_subscription(identity, owner, indexed_only=indexed_only) != {"status": "existing", "sid": sid}):
+                return {"kind": "unknown", "sid": sid}
+            return {"kind": kind, "sid": sid}
+        except _NotSent:
+            return not_sent
+        except Exception:
+            return unknown

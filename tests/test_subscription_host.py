@@ -1,5 +1,6 @@
 """Offline contracts for the V2 TMDB movie and TV season subscription adapter."""
 from datetime import date
+from enum import Enum
 import importlib.util
 from pathlib import Path
 import sys
@@ -54,6 +55,139 @@ class FakeNative:
         self.calls += 1
         self.current.append(row())
         return 12, "新增订阅成功"
+
+
+class V3BoundaryTests(unittest.TestCase):
+    class MediaType(str, Enum):
+        MOVIE = "电影"
+        TV = "电视剧"
+
+    def receiver(self, target=TV, allowed=lambda: True):
+        writes = []
+        repository = SimpleNamespace(add=lambda **kwargs: writes.append(kwargs) or (42, "新增订阅成功"))
+
+        class SplitChain:
+            subscription_repository = repository
+
+            def _SubscribeChain__get_default_kwargs(self, *args, **kwargs):
+                return {"best_version": 0}
+
+            def obtain_images(self, *, mediainfo):
+                return mediainfo
+
+            def finalize(self, media):
+                self.obtain_images(mediainfo=media)
+                return self.subscription_repository
+
+        SplitChain.finalize.__module__ = "app.chain.subscribe.create"
+        media_type = self.MediaType.TV if target["media_type"] == "tv" else self.MediaType.MOVIE
+        receiver = host._ExactRecognitionV3(SplitChain(), target, media_type, allowed, "FixtureOwner")
+        media = SimpleNamespace(type=media_type, media_source="themoviedb", media_id="123", tmdb_id=123,
+                                episode_group=None, seasons={2: [1, 2]})
+        return receiver, media, writes
+
+    def request(self, receiver, **changes):
+        values = {"media_source": "themoviedb", "media_id": "123", "type": receiver.media_type.value,
+                  "season": receiver.identity["season"], "episode_group": None, "music_type": None,
+                  "username": "FixtureOwner", "best_version": 0, **changes}
+        identity = SimpleNamespace(**{key: values[key] for key in (
+            "media_source", "media_id", "type", "season", "episode_group", "music_type")})
+        return {"identity": identity, "payload": SimpleNamespace(to_payload=lambda: values),
+                "username": "FixtureOwner"}
+
+    def test_split_helpers_rebind_to_per_call_receiver_and_canonical_media(self):
+        receiver, media, writes = self.receiver()
+        self.assertIs(receiver.finalize(media), receiver.subscription_repository)
+        self.assertIsNot(receiver.chain.subscription_repository, receiver.subscription_repository)
+        self.assertFalse(receiver.past_guard)
+        media.media_id = "456"
+        with self.assertRaises(host._NotSent):
+            receiver.finalize(media)
+        self.assertEqual(writes, [])
+
+    def test_final_transaction_guard_rejects_changed_identity_owner_upgrade_and_revocation(self):
+        for changes in ({"media_id": "456"}, {"media_source": "douban"}, {"type": "电影"},
+                        {"season": 1}, {"season": None}, {"episode_group": "alt"},
+                        {"username": "Other"}, {"best_version": 1}, {"best_version_full": 1},
+                        {"music_type": "album"}):
+            receiver, media, writes = self.receiver()
+            with self.subTest(changes=changes), self.assertRaises(host._NotSent):
+                receiver.subscription_repository.add(**self.request(receiver, **changes))
+            self.assertFalse(receiver.past_guard)
+            self.assertEqual(writes, [])
+        receiver, media, writes = self.receiver(allowed=lambda: False)
+        self.assertEqual(receiver._defaults(), {"best_version": 0})
+        with self.assertRaises(host._NotSent):
+            receiver.subscription_repository.add(**self.request(receiver))
+        self.assertFalse(receiver.past_guard)
+        self.assertEqual(writes, [])
+
+    def test_movie_and_latest_season_write_once_and_preserve_native_callback(self):
+        for target in (MOVIE, TV):
+            receiver, media, writes = self.receiver(target)
+            request = self.request(receiver)
+            callback = lambda sid: None
+            result = receiver.subscription_repository.add(**request, after_commit=callback, occurrence_id="fixture")
+            self.assertEqual(result, (42, "新增订阅成功"))
+            self.assertTrue(receiver.past_guard)
+            self.assertEqual(len(writes), 1)
+            self.assertIs(writes[0]["after_commit"], callback)
+
+    def test_v3_native_call_uses_only_canonical_ids_and_never_defaults_tv_to_first_season(self):
+        receiver, media, writes = self.receiver()
+        native = object.__new__(host._MoviePilot)
+        native.version = host.V3_VERSION
+        native.movie_type, native.tv_type = self.MediaType.MOVIE, self.MediaType.TV
+        native.chain_type = lambda: receiver.chain
+        native._detail = lambda *args: detail()
+        calls = []
+
+        def add(proxy, **kwargs):
+            calls.append(kwargs)
+            return proxy.subscription_repository.add(**self.request(proxy))
+
+        native.native_add = add
+        self.assertEqual(native.add(TV, "FixtureOwner", lambda: True), (42, "新增订阅成功"))
+        self.assertEqual(calls[0]["season"], 2)
+        self.assertEqual(calls[0]["media_id"], "123")
+        self.assertNotIn("tmdbid", calls[0])
+        self.assertTrue(calls[0]["owner_scope"])
+
+    def test_v3_namespaces_ignore_other_media_but_still_block_other_owners_and_history(self):
+        native = FakeNative()
+        native.version = host.V3_VERSION
+        adapter = host.HostSubscriptionAdapter(lambda: [SERVER], native_factory=lambda: native)
+        self.assertEqual(adapter.compatibility("FixtureOwner")["version"], host.V3_VERSION)
+        native.current = [row(type="音乐", media_source="musicbrainz", media_id="fixture", tmdbid=None),
+                          row(type="电视剧", season=2)]
+        self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "absent")
+        native.current.append(row(username="Other", tmdbid=None))
+        self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "conflict")
+        native.current, native.history = [], [row(tmdbid=None)]
+        self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "conflict")
+
+    def test_v3_native_null_default_is_read_back_as_normal_subscription(self):
+        # V3's create preset includes best_version=None, which explicitly
+        # persists NULL rather than applying the ORM's default of zero.
+        native = FakeNative()
+        native.version = host.V3_VERSION
+        adapter = host.HostSubscriptionAdapter(lambda: [SERVER], native_factory=lambda: native,
+                                                library_probe=lambda *args: "absent")
+        for target in (MOVIE, TV):
+            record = row(tmdbid=None, best_version=None, type="电影" if target is MOVIE else "电视剧",
+                         season=target["season"])
+            native.current = [record]
+            self.assertEqual(adapter.lookup_subscription(target, "FixtureOwner"), {"status": "existing", "sid": 12})
+            for upgrade in (1, 2, "0"):
+                native.current = [{**record, "best_version": upgrade}]
+                self.assertEqual(adapter.lookup_subscription(target, "FixtureOwner")["status"], "conflict")
+            native.current = []
+            native.history = [record]
+            self.assertEqual(adapter.lookup_subscription(target, "FixtureOwner")["status"], "conflict")
+            native.history = []
+        native.version = host.VERSION
+        native.current = [row(best_version=None)]
+        self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "conflict")
 
 
 class HostTests(unittest.TestCase):

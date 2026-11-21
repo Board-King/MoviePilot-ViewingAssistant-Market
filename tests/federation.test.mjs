@@ -56,3 +56,42 @@ test('the subtitle rail lets a user inspect and filter independent results in a 
   filter.props.onClick()
   assert.equal(results().length,3)
 })
+
+for (const wrapped of [false, true]) test(`${wrapped ? 'V3' : 'V2'} board loads host pages and refreshes with raw plugin actions`, async () => {
+  const shell = await readFile(new URL('../frontend/shell.js',import.meta.url),'utf8')
+  const page = await readFile(new URL('../frontend/page.js',import.meta.url),'utf8')
+  const makePage = runInNewContext(shell + '\n' + page + '\n;makePage', {
+    makeTonight:()=> 'Tonight', makeShelf:()=> 'Shelf', makeSubtitleRail:()=> 'Subtitles', makeSupport:()=> 'Support',
+  })
+  let mounted, reads = 0
+  const calls = [], pid = 'PtSubtitleFollowup'
+  const h = (type, props, children) => ({type, props:props || {}, children:children?.default ? children.default() : children})
+  const Vue = {h, ref:value=>({value}), computed:fn=>({get value(){return fn()}}),
+    onMounted:fn=>{mounted=fn}, onUnmounted(){}, resolveComponent:name=>name, nextTick:fn=>fn()}
+  const api = {
+    async get(url) {
+      calls.push(['GET',url]); reads++
+      assert.equal(url,'plugin/page/'+pid)
+      const data = {render_mode:'vue',page:[
+        {component:'strong',text:reads === 1 ? '每日发现' : '已刷新'},
+        {component:'VBtn',text:'更新候选',props:{'data-va-primary':'refresh-candidates'},
+          events:{click:{api:'plugin/'+pid+'/fusion/candidates/refresh',method:'POST'}}},
+      ]}
+      return wrapped ? {success:true,message:'',data} : data
+    },
+    async post(url) { calls.push(['POST',url]); return {success:true,message:'已排队'} },
+  }
+  const render = makePage(Vue,pid).setup({api},{emit(){}})
+  const flatten = node => Array.isArray(node) ? node.flatMap(flatten) : node && typeof node === 'object' ?
+    [node,...flatten(node.children)] : []
+  await mounted()
+  assert.equal(calls.length,1) // Mount never starts discovery or creates a subscription.
+  assert.ok(flatten(render()).some(node=>node.children?.includes('每日发现')))
+  const button = flatten(render()).find(node=>node.type === 'VBtn' && node.children?.includes('更新候选'))
+  assert.ok(button)
+  button.props.onClick()
+  await new Promise(resolve=>setImmediate(resolve))
+  assert.deepEqual(calls.map(row=>row[0]),['GET','POST','GET'])
+  assert.ok(flatten(render()).some(node=>node.children?.includes('已刷新')))
+  assert.ok(flatten(render()).some(node=>node.children === '已排队'))
+})

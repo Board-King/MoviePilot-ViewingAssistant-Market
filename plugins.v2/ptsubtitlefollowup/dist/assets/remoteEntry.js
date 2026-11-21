@@ -2,6 +2,15 @@
 // Shared chrome keeps navigation and the current action in the same place as
 // the host replaces the data dialog with its configuration dialog.
 let vaHandoff = null
+// V3 wraps host management endpoints in {success,message,data}; V2 supplies
+// their payload directly. Plugin-owned endpoints retain their own contracts.
+function vaHostPayload(response) {
+  if (response && typeof response.success === 'boolean' && Object.hasOwn(response, 'data')) {
+    if (response.success !== true || !response.data || typeof response.data !== 'object') throw Error('host request failed')
+    return response.data
+  }
+  return response
+}
 function vaLeaveBoard(position) {
   vaHandoff = {next:'config',position,time:Date.now()}
 }
@@ -189,7 +198,7 @@ function makePage(Vue, pluginId) {
         return null
       })
       async function load() {
-        const result = await props.api.get('plugin/page/' + pluginId)
+        const result = vaHostPayload(await props.api.get('plugin/page/' + pluginId))
         if (!Array.isArray(result?.page) || result.render_mode !== 'vue') throw Error('invalid page')
         rows.value = result.page
       }
@@ -1127,7 +1136,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
         message.value = ''
         try {
           if (!validId) throw Error()
-          const response = await props.api.get('plugin/form/' + pluginId)
+          const response = vaHostPayload(await props.api.get('plugin/form/' + pluginId))
           if (response?.render_mode !== 'vue' || !Array.isArray(response.conf) || !response.conf.length || !response.model ||
               typeof response.model !== 'object' || Array.isArray(response.model)) throw Error()
           if (!alive) return
@@ -1189,7 +1198,7 @@ function makeConfig(Vue, renderNode, Support, pluginId) {
       }
       async function persistDraft(snapshot) {
         if (JSON.stringify(snapshot) === original) return true
-        const latest = await props.api.get('plugin/form/' + pluginId)
+        const latest = vaHostPayload(await props.api.get('plugin/form/' + pluginId))
         if (!alive) return false
         if (!latest?.model || JSON.stringify(latest.model) !== original) {
           conflict.value = true
