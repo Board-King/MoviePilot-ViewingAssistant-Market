@@ -1,11 +1,30 @@
 const vaShelfStyle = `
-.va-shelf .va-reason-trigger{display:flex;flex-wrap:wrap;align-items:center;gap:2px 7px;min-height:32px;max-width:100%;text-align:start;font-variant-numeric:tabular-nums}
+.va-shelf .va-candidate{align-self:stretch;display:flex;flex-direction:column;min-width:0}
+.va-shelf .va-reason-trigger{display:flex;flex-wrap:wrap;align-items:flex-start;align-content:flex-start;align-self:flex-start;margin-block-start:auto;padding-block:6px;gap:2px 7px;min-height:32px;max-width:100%;text-align:start;font-variant-numeric:tabular-nums}
+@supports(grid-template-rows:subgrid){
+  .va-shelf .va-candidate{display:grid;grid-row:span 2;grid-template-rows:subgrid;row-gap:0}
+  .va-shelf .va-reason-trigger{margin-block-start:0;justify-self:start}
+}
 .va-shelf .va-match,.va-shelf .va-rating{display:inline-flex;align-items:center;gap:3px;white-space:nowrap}
 .va-shelf .va-match{color:rgb(var(--v-theme-primary));font-weight:600}
 .va-shelf .va-match-track{width:15px;height:4px;overflow:hidden;border-radius:4px;background:rgba(var(--v-theme-primary),.17)}
 .va-shelf .va-match-track>span{display:block;height:100%;background:currentColor;border-radius:inherit}
 .va-shelf .va-rating{color:rgba(var(--v-theme-on-surface),.72)}
+@media(pointer:coarse){.va-shelf .va-reason-trigger{min-height:44px;padding-block:10px}}
 `
+
+// Cards share the grid's metadata and score tracks, including cards without a poster link.
+function vaRenderShelfCard(Vue, card, explain) {
+  const detail = Array.isArray(card?.content) && card.content.find(child=>child?.props?.['data-va-reason'])
+  if (!detail) return renderNode(Vue,card)
+  const summary = detail.content[0]
+  return Vue.h('div',card.props,[
+    Vue.h('div',card.content.filter(child=>child!==detail).map(child=>renderNode(Vue,child))),
+    Vue.h('button',{type:'button',class:'va-reason-trigger text-caption text-medium-emphasis',
+      'aria-label':summary.props['aria-label'],'aria-haspopup':'dialog',onClick:e=>explain(detail,e)},
+      summary.content?.length ? summary.content.map(part=>renderNode(Vue,part)) : summary.text),
+  ])
+}
 
 function makeShelf(Vue) {
   const {h, ref, computed, resolveComponent, watch, onUnmounted} = Vue
@@ -99,16 +118,6 @@ function makeShelf(Vue) {
       }
       const icon = (path, size) => h('svg', {width:size,height:size,viewBox:'0 0 24 24',fill:'none',
         stroke:'currentColor','stroke-width':1.8,'stroke-linecap':'round','stroke-linejoin':'round','aria-hidden':'true'},[h('path',{d:path})])
-      function renderCard(card) {
-        if (!Array.isArray(card?.content) || !card.content.some(child=>child?.props?.['data-va-reason'])) return renderNode(Vue,card)
-        return h('div',card.props,card.content.map(child=>{
-          if (!child?.props?.['data-va-reason']) return renderNode(Vue,child)
-          const summary = child.content[0]
-          return h('button',{type:'button',class:'va-reason-trigger text-caption text-medium-emphasis',
-            'aria-label':summary.props['aria-label'],'aria-haspopup':'dialog',onClick:e=>explain(child,e)},
-            summary.content?.length ? summary.content.map(part=>renderNode(Vue,part)) : summary.text)
-        }))
-      }
       function reasonDialog() {
         const title = reason.value?.props['data-va-reason']
         return h('dialog',{ref:dialog,class:'va-reason-dialog','aria-label':title ? title+'的推荐依据' : '推荐依据',
@@ -146,7 +155,7 @@ function makeShelf(Vue) {
         failed.value ? h('div',{role:'alert'},['片单暂时无法读取。',button('重试',read)]) :
         !total.value ? h('div',{class:'py-4'},['这个范围暂时没有候选。',button('查看全部',()=>choose('all','all'))]) :
         h('div',{...grid.value.props,style:[grid.value.props.style,{gridTemplateColumns:'repeat('+columns.value+',minmax(0,1fr))'}]},
-          (view.value?.cards ?? []).map(renderCard)),
+          (view.value?.cards ?? []).map(card=>vaRenderShelfCard(Vue,card,explain))),
         !busy.value && !failed.value && pages.value > 1 ? h('nav',{'aria-label':'候选翻页',class:'d-flex align-center justify-center ga-2 mt-4'},[
           button('上一页',()=>choose(kind.value,period.value,page.value-1),{disabled:page.value<=1}),
           h('span',{class:'text-caption text-medium-emphasis','aria-live':'polite'},page.value+' / '+pages.value),

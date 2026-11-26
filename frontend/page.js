@@ -37,6 +37,7 @@ function renderNode(Vue, node, ctx = {}) {
   if (props['data-va-settings'] && ctx.onSwitch) props.onClick = () => ctx.onSwitch(props['data-va-settings'])
   const children = () => [...(node.text == null ? [] : [String(node.text)]),
     ...(node.content || []).map(child => renderNode(Vue, child, ctx))]
+  if (name === 'summary') return Vue.h('summary', props, [Vue.h('span',{class:'va-press-label'},children())])
   return Vue.h(native ? name : Vue.resolveComponent(name), props, native ? children() : {default:children})
 }
 
@@ -128,7 +129,7 @@ function makePage(Vue, pluginId) {
                 onSwitch:props.show_switch ? settings : undefined})),
             rows.value ? h('details',{class:'va-more mt-3',open:showTonight.value,
               onToggle:event=>{showTonight.value=event.currentTarget.open}},[
-              h('summary','今晚看什么'),
+              h('summary', [h('span',{class:'va-press-label'},'今晚看什么')]),
               showTonight.value ? h(Tonight,{api:props.api,pluginId,initial:rows.value,
                 onSettings:props.show_switch ? settings : undefined}) : null,
             ]) : null,

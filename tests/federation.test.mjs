@@ -6,6 +6,47 @@ import path from 'node:path'
 import {pathToFileURL} from 'node:url'
 import {runInNewContext} from 'node:vm'
 
+test('linked and unlinked candidate cards share the same score track', async () => {
+  const source = await readFile(new URL('../frontend/shelf.js',import.meta.url),'utf8')
+  const {render,style} = runInNewContext(source + '\n;({render:vaRenderShelfCard,style:vaShelfStyle})', {
+    renderNode:(_Vue,part)=>part,
+  })
+  const Vue={h:(tag,props,children)=>({tag,children:children??props,props})}
+  const score={props:{'data-va-reason':'Film'},content:[{props:{'aria-label':'Score'},text:'Match'}]}
+  for (const info of [[{component:'a'},{component:'small'}],[{component:'img'},{component:'strong'},{component:'small'}]]) {
+    let opened
+    const result = render(Vue,{props:{class:'va-candidate'},content:[...info,score]},node=>{opened=node})
+    assert.equal(result.children.length,2)
+    const [metadata,button]=result.children
+    assert.deepEqual(Array.from(metadata.children),info)
+    assert.equal(button.tag,'button')
+    button.props.onClick()
+    assert.equal(opened,score)
+  }
+  assert.match(style,/\.va-candidate\s*\{[^}]*grid-row:\s*span 2[^}]*grid-template-rows:\s*subgrid/)
+})
+
+test('press feedback on dashboard disclosures keeps the actual pointer target stationary', async () => {
+  // Vue mounts shelf and tonight styles after the shell. A transform from any
+  // of them can move a wide summary out from under the pointer before release.
+  const styles = await Promise.all(['shell','shelf','tonight'].map(async part => {
+    const source = await readFile(new URL(`../frontend/${part}.js`,import.meta.url),'utf8')
+    return runInNewContext(source + '\n;va' + part[0].toUpperCase() + part.slice(1) + 'Style')
+  }))
+  const moving = []
+  for (const style of styles) {
+    for (const [,head,body] of style.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (!/(?:^|;)\s*(?:transform|scale|translate)\s*:/.test(body)) continue
+      for (const selector of head.split(/,(?![^()]*\))/)) {
+        if (selector.includes(':active')) moving.push(selector.trim())
+      }
+    }
+  }
+  assert.ok(moving.length,'buttons still give visible press feedback')
+  for (const selector of moving)
+    assert.match(selector,/:active\s*(?:>|\s)\s*[^\s]/,`the pressed element itself must stay still: ${selector}`)
+})
+
 // Exercise the shipped bytes with the same shared-provider/factory contract
 // as MP's Vite host; a clone must never address the primary install's APIs.
 test('the distributed module mounts both exposes only for the reviewed installation', async () => {

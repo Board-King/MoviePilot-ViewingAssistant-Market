@@ -15,9 +15,8 @@ const vaTonightStyle = `
 .va-tonight-pick a:hover{background:rgba(var(--v-theme-primary),.16)}
 .va-tonight-actions{width:100%;margin-top:auto;padding-top:6px;gap:2px}.va-tonight-actions .v-btn{padding-inline:6px;min-width:0;font-size:.75rem;letter-spacing:normal}
 .va-tonight-message{margin-top:8px;font-size:.85rem}.va-tonight-notice{margin-top:10px;padding:6px 10px;border-radius:8px;background:rgba(var(--v-theme-primary),.065);font-size:.8125rem;gap:4px 8px}.va-tonight-notice:focus{outline:2px solid rgb(var(--v-theme-primary));outline-offset:2px}
-.va-tonight-pages{justify-content:flex-end;margin-top:8px;font-size:.75rem}.va-tonight button:not(:disabled){transition:transform 230ms cubic-bezier(.2,1.65,.4,1),background-color 140ms ease}.va-tonight button:not(:disabled):active{transform:scale(.94);transition:transform 65ms ease-out}
+.va-tonight-pages{justify-content:flex-end;margin-top:8px;font-size:.75rem}
 @media(pointer:coarse){.va-tonight :is(button,a,select){min-height:44px}}
-@media(prefers-reduced-motion:reduce){.va-tonight button:not(:disabled){transition:none!important;transform:none!important}}
 `
 
 // Emby details links come from the bound server. Keep browser links limited

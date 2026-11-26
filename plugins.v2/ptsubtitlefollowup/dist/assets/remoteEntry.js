@@ -76,13 +76,16 @@ const vaShellStyle = `
 .va-toolbar{padding:8px 16px max(8px,env(safe-area-inset-bottom));border-top:1px solid rgba(var(--v-theme-on-surface),.12)}
 .va-toolbar nav,.va-toolbar .va-actions{display:flex;align-items:center;gap:4px}
 .va-toolbar .va-actions{justify-content:flex-end;flex-wrap:wrap}
-.va-shell button:not(:disabled),.va-shell .va-reason-trigger,.va-shell summary{transition:transform 230ms cubic-bezier(.2,1.65,.4,1),background-color 140ms ease}
-.va-shell button:not(:disabled):active,.va-shell summary:active{transform:scale(.94);transition:transform 65ms ease-out}
+/* Keep the pointer target fixed between press and release. */
+.va-shell :is(button,summary){touch-action:manipulation}
+.va-shell .va-press-label{display:inline-block}
+.va-shell button>:is(.v-btn__content,.va-match,.va-rating,svg),.va-shell summary>.va-press-label{transition:transform 230ms cubic-bezier(.2,1.65,.4,1)}
+.va-shell button:not(:disabled):active>:is(.v-btn__content,.va-match,.va-rating,svg),.va-shell summary:active>.va-press-label{transform:scale(.94);transition:transform 65ms ease-out}
 .va-shell :is(button,a,summary):focus-visible{outline:2px solid rgb(var(--v-theme-primary));outline-offset:2px}
 .va-toolbar .v-btn{letter-spacing:normal;min-width:0;min-height:36px}
-@media(pointer:coarse){.va-toolbar .v-btn,.va-header button{min-height:44px}}
+@media(pointer:coarse){.va-toolbar .v-btn,.va-header button,.va-shell summary{min-height:44px}}
 @media(max-width:500px){.va-toolbar{padding-inline:8px;gap:3px}.va-toolbar nav,.va-toolbar .va-actions{gap:2px}.va-toolbar .v-btn{padding-inline:8px}}
-@media(prefers-reduced-motion:reduce){.va-shell button:not(:disabled),.va-shell .va-reason-trigger,.va-shell summary{transition:none!important;transform:none!important}}
+@media(prefers-reduced-motion:reduce){.va-shell button>:is(.v-btn__content,.va-match,.va-rating,svg),.va-shell summary>.va-press-label{transition:none!important;transform:none!important}}
 `
 
 function vaHeader(Vue, title, onClose, busy) {
@@ -149,6 +152,7 @@ function renderNode(Vue, node, ctx = {}) {
   if (props['data-va-settings'] && ctx.onSwitch) props.onClick = () => ctx.onSwitch(props['data-va-settings'])
   const children = () => [...(node.text == null ? [] : [String(node.text)]),
     ...(node.content || []).map(child => renderNode(Vue, child, ctx))]
+  if (name === 'summary') return Vue.h('summary', props, [Vue.h('span',{class:'va-press-label'},children())])
   return Vue.h(native ? name : Vue.resolveComponent(name), props, native ? children() : {default:children})
 }
 
@@ -240,7 +244,7 @@ function makePage(Vue, pluginId) {
                 onSwitch:props.show_switch ? settings : undefined})),
             rows.value ? h('details',{class:'va-more mt-3',open:showTonight.value,
               onToggle:event=>{showTonight.value=event.currentTarget.open}},[
-              h('summary','今晚看什么'),
+              h('summary', [h('span',{class:'va-press-label'},'今晚看什么')]),
               showTonight.value ? h(Tonight,{api:props.api,pluginId,initial:rows.value,
                 onSettings:props.show_switch ? settings : undefined}) : null,
             ]) : null,
@@ -259,13 +263,32 @@ function makePage(Vue, pluginId) {
 }
 
 const vaShelfStyle = `
-.va-shelf .va-reason-trigger{display:flex;flex-wrap:wrap;align-items:center;gap:2px 7px;min-height:32px;max-width:100%;text-align:start;font-variant-numeric:tabular-nums}
+.va-shelf .va-candidate{align-self:stretch;display:flex;flex-direction:column;min-width:0}
+.va-shelf .va-reason-trigger{display:flex;flex-wrap:wrap;align-items:flex-start;align-content:flex-start;align-self:flex-start;margin-block-start:auto;padding-block:6px;gap:2px 7px;min-height:32px;max-width:100%;text-align:start;font-variant-numeric:tabular-nums}
+@supports(grid-template-rows:subgrid){
+  .va-shelf .va-candidate{display:grid;grid-row:span 2;grid-template-rows:subgrid;row-gap:0}
+  .va-shelf .va-reason-trigger{margin-block-start:0;justify-self:start}
+}
 .va-shelf .va-match,.va-shelf .va-rating{display:inline-flex;align-items:center;gap:3px;white-space:nowrap}
 .va-shelf .va-match{color:rgb(var(--v-theme-primary));font-weight:600}
 .va-shelf .va-match-track{width:15px;height:4px;overflow:hidden;border-radius:4px;background:rgba(var(--v-theme-primary),.17)}
 .va-shelf .va-match-track>span{display:block;height:100%;background:currentColor;border-radius:inherit}
 .va-shelf .va-rating{color:rgba(var(--v-theme-on-surface),.72)}
+@media(pointer:coarse){.va-shelf .va-reason-trigger{min-height:44px;padding-block:10px}}
 `
+
+// Cards share the grid's metadata and score tracks, including cards without a poster link.
+function vaRenderShelfCard(Vue, card, explain) {
+  const detail = Array.isArray(card?.content) && card.content.find(child=>child?.props?.['data-va-reason'])
+  if (!detail) return renderNode(Vue,card)
+  const summary = detail.content[0]
+  return Vue.h('div',card.props,[
+    Vue.h('div',card.content.filter(child=>child!==detail).map(child=>renderNode(Vue,child))),
+    Vue.h('button',{type:'button',class:'va-reason-trigger text-caption text-medium-emphasis',
+      'aria-label':summary.props['aria-label'],'aria-haspopup':'dialog',onClick:e=>explain(detail,e)},
+      summary.content?.length ? summary.content.map(part=>renderNode(Vue,part)) : summary.text),
+  ])
+}
 
 function makeShelf(Vue) {
   const {h, ref, computed, resolveComponent, watch, onUnmounted} = Vue
@@ -359,16 +382,6 @@ function makeShelf(Vue) {
       }
       const icon = (path, size) => h('svg', {width:size,height:size,viewBox:'0 0 24 24',fill:'none',
         stroke:'currentColor','stroke-width':1.8,'stroke-linecap':'round','stroke-linejoin':'round','aria-hidden':'true'},[h('path',{d:path})])
-      function renderCard(card) {
-        if (!Array.isArray(card?.content) || !card.content.some(child=>child?.props?.['data-va-reason'])) return renderNode(Vue,card)
-        return h('div',card.props,card.content.map(child=>{
-          if (!child?.props?.['data-va-reason']) return renderNode(Vue,child)
-          const summary = child.content[0]
-          return h('button',{type:'button',class:'va-reason-trigger text-caption text-medium-emphasis',
-            'aria-label':summary.props['aria-label'],'aria-haspopup':'dialog',onClick:e=>explain(child,e)},
-            summary.content?.length ? summary.content.map(part=>renderNode(Vue,part)) : summary.text)
-        }))
-      }
       function reasonDialog() {
         const title = reason.value?.props['data-va-reason']
         return h('dialog',{ref:dialog,class:'va-reason-dialog','aria-label':title ? title+'的推荐依据' : '推荐依据',
@@ -406,7 +419,7 @@ function makeShelf(Vue) {
         failed.value ? h('div',{role:'alert'},['片单暂时无法读取。',button('重试',read)]) :
         !total.value ? h('div',{class:'py-4'},['这个范围暂时没有候选。',button('查看全部',()=>choose('all','all'))]) :
         h('div',{...grid.value.props,style:[grid.value.props.style,{gridTemplateColumns:'repeat('+columns.value+',minmax(0,1fr))'}]},
-          (view.value?.cards ?? []).map(renderCard)),
+          (view.value?.cards ?? []).map(card=>vaRenderShelfCard(Vue,card,explain))),
         !busy.value && !failed.value && pages.value > 1 ? h('nav',{'aria-label':'候选翻页',class:'d-flex align-center justify-center ga-2 mt-4'},[
           button('上一页',()=>choose(kind.value,period.value,page.value-1),{disabled:page.value<=1}),
           h('span',{class:'text-caption text-medium-emphasis','aria-live':'polite'},page.value+' / '+pages.value),
@@ -434,9 +447,8 @@ const vaTonightStyle = `
 .va-tonight-pick a:hover{background:rgba(var(--v-theme-primary),.16)}
 .va-tonight-actions{width:100%;margin-top:auto;padding-top:6px;gap:2px}.va-tonight-actions .v-btn{padding-inline:6px;min-width:0;font-size:.75rem;letter-spacing:normal}
 .va-tonight-message{margin-top:8px;font-size:.85rem}.va-tonight-notice{margin-top:10px;padding:6px 10px;border-radius:8px;background:rgba(var(--v-theme-primary),.065);font-size:.8125rem;gap:4px 8px}.va-tonight-notice:focus{outline:2px solid rgb(var(--v-theme-primary));outline-offset:2px}
-.va-tonight-pages{justify-content:flex-end;margin-top:8px;font-size:.75rem}.va-tonight button:not(:disabled){transition:transform 230ms cubic-bezier(.2,1.65,.4,1),background-color 140ms ease}.va-tonight button:not(:disabled):active{transform:scale(.94);transition:transform 65ms ease-out}
+.va-tonight-pages{justify-content:flex-end;margin-top:8px;font-size:.75rem}
 @media(pointer:coarse){.va-tonight :is(button,a,select){min-height:44px}}
-@media(prefers-reduced-motion:reduce){.va-tonight button:not(:disabled){transition:none!important;transform:none!important}}
 `
 
 // Emby details links come from the bound server. Keep browser links limited

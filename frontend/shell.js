@@ -75,13 +75,16 @@ const vaShellStyle = `
 .va-toolbar{padding:8px 16px max(8px,env(safe-area-inset-bottom));border-top:1px solid rgba(var(--v-theme-on-surface),.12)}
 .va-toolbar nav,.va-toolbar .va-actions{display:flex;align-items:center;gap:4px}
 .va-toolbar .va-actions{justify-content:flex-end;flex-wrap:wrap}
-.va-shell button:not(:disabled),.va-shell .va-reason-trigger,.va-shell summary{transition:transform 230ms cubic-bezier(.2,1.65,.4,1),background-color 140ms ease}
-.va-shell button:not(:disabled):active,.va-shell summary:active{transform:scale(.94);transition:transform 65ms ease-out}
+/* Keep the pointer target fixed between press and release. */
+.va-shell :is(button,summary){touch-action:manipulation}
+.va-shell .va-press-label{display:inline-block}
+.va-shell button>:is(.v-btn__content,.va-match,.va-rating,svg),.va-shell summary>.va-press-label{transition:transform 230ms cubic-bezier(.2,1.65,.4,1)}
+.va-shell button:not(:disabled):active>:is(.v-btn__content,.va-match,.va-rating,svg),.va-shell summary:active>.va-press-label{transform:scale(.94);transition:transform 65ms ease-out}
 .va-shell :is(button,a,summary):focus-visible{outline:2px solid rgb(var(--v-theme-primary));outline-offset:2px}
 .va-toolbar .v-btn{letter-spacing:normal;min-width:0;min-height:36px}
-@media(pointer:coarse){.va-toolbar .v-btn,.va-header button{min-height:44px}}
+@media(pointer:coarse){.va-toolbar .v-btn,.va-header button,.va-shell summary{min-height:44px}}
 @media(max-width:500px){.va-toolbar{padding-inline:8px;gap:3px}.va-toolbar nav,.va-toolbar .va-actions{gap:2px}.va-toolbar .v-btn{padding-inline:8px}}
-@media(prefers-reduced-motion:reduce){.va-shell button:not(:disabled),.va-shell .va-reason-trigger,.va-shell summary{transition:none!important;transform:none!important}}
+@media(prefers-reduced-motion:reduce){.va-shell button>:is(.v-btn__content,.va-match,.va-rating,svg),.va-shell summary>.va-press-label{transition:none!important;transform:none!important}}
 `
 
 function vaHeader(Vue, title, onClose, busy) {

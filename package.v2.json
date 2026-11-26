@@ -2,7 +2,7 @@
   "PtSubtitleFollowup": {
     "name": "观影助手",
     "description": "按你的 Emby 口味，每天自动订阅电影和剧集。",
-    "version": "0.8.1",
+    "version": "0.9.0",
     "author": "Board-King",
     "level": 1,
     "icon": "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png",
@@ -11,6 +11,7 @@
     "v3": false,
     "release": true,
     "history": {
+      "v0.9.0": "追更缺集先找原组，满 3 小时可借同规格备组，原组出现后逐集换回。候选片单同排匹配分对齐，修复详情点击边缘时无法展开。",
       "v0.8.1": "兼容 MoviePilot V3 3.2.9，保留 V2 2.15.6 支持。适配市场安装、设置保存、字幕事件和每日 3 部电影 + 1 部剧集的自动订阅。支持标准 Python / SQLite；V2 升级 V3 后需重新确认订阅范围。",
       "v0.8.0": "每日自动发现根据 Emby 偏好查找电影和剧集，默认每天最多 3 部电影和 1 部剧。剧集核对到季，电影和剧集各用各的名额。",
       "v0.7.1": "今晚选片可以「留到下次」或「不感兴趣」，支持撤销与恢复推荐。留下的电影集中查看，选择随个人绑定保留，无需增加设置。",

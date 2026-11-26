@@ -1,8 +1,4 @@
-"""Personal discovery, automatic subscriptions and original-release subtitles.
-
-Only download/transfer completion events and explicitly selected download records
-enter this queue. This plugin never calls transfer, delete, AI or download APIs.
-"""
+"""Personal discovery, automatic subscriptions, episode gap repair and subtitles."""
 from __future__ import annotations
 
 import base64
@@ -39,6 +35,9 @@ from .fusion.execution_store import ExecutionStore
 from .fusion.execution_space import host_movie_download_space
 from .fusion.execution_ui import EXECUTION_DEFAULTS, get_execution_form, render_execution
 from .fusion.subscription_host import HostSubscriptionAdapter
+from .fusion.gaps import GapService
+from .fusion.gap_host import GapHost
+from .fusion.gap_ui import gap_form, gap_panel
 
 
 class SeedRequest(BaseModel):
@@ -113,7 +112,7 @@ class PtSubtitleFollowup(_PluginBase):
     plugin_name = "观影助手"
     plugin_desc = "按你的 Emby 口味，每天自动订阅电影和剧集。"
     plugin_icon = "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png"
-    plugin_version = "0.8.1"
+    plugin_version = "0.9.0"
     plugin_author = "Board-King"
     author_url = "https://github.com/Board-King"
     plugin_url = "https://github.com/Board-King/MoviePilot-ViewingAssistant-Market"
@@ -135,7 +134,10 @@ class PtSubtitleFollowup(_PluginBase):
         self._artwork = CandidateArtwork(lambda: self.get_data_path(), self._discovery_credentials)
         # Clones may rank candidates but have no separate execution authority or ledger.
         self._execution = None
+        self._gaps = None
         if type(self).__name__ == "PtSubtitleFollowup" and not getattr(self, "is_clone", False):
+            self._gaps = GapService(lambda: self.get_data_path() / "episode-gaps", GapHost,
+                                    current_config=self.get_config)
             self._execution = ExecutionService(
                 ExecutionStore(lambda: self.get_data_path() / "automatic-subscriptions"),
                 self._candidates.status, lambda: HostSubscriptionAdapter(self._all_media_servers),
@@ -146,6 +148,8 @@ class PtSubtitleFollowup(_PluginBase):
 
     def init_plugin(self, config=None):
         config = config or {}
+        if self._gaps:
+            self._gaps.configure(config)
         self._enabled = bool(config.get("enabled", False))
         self._hours = max(1, min(24, int(config.get("interval_hours") or 3)))
         self._days = max(1, min(14, int(config.get("retry_days") or 7)))
@@ -169,11 +173,14 @@ class PtSubtitleFollowup(_PluginBase):
         return "vuetify", None
 
     def get_state(self):
-        return bool(self._enabled or self._fusion.enabled or self._candidates.enabled or
-                    self._execution and self._execution.needs_tick)
+        return bool(self._enabled or self._fusion.enabled or self._candidates.enabled
+                    or (self._gaps and self._gaps.enabled) or (self._execution and self._execution.needs_tick))
 
     def get_service(self):
         services = []
+        if self._gaps and self._gaps.enabled:
+            services.append({"id": "PtSubtitleFollowupEpisodeGaps", "name": "剧集补缺",
+                             "trigger": "interval", "func": self._gaps.tick, "kwargs": {"minutes": 5}})
         if self._enabled:
             services.append({"id": "PtSubtitleFollowupRetry", "name": "PT配套字幕延迟补查",
                              "trigger": "interval", "func": self.run_once, "kwargs": {"hours": self._hours}})
@@ -189,6 +196,8 @@ class PtSubtitleFollowup(_PluginBase):
         return services
 
     def stop_service(self):
+        if self._gaps:
+            self._gaps.stop()
         if self._execution:
             self._execution.stop()
         self._artwork.stop()
@@ -728,8 +737,10 @@ class PtSubtitleFollowup(_PluginBase):
             ]),
         ])
         execution_form = get_execution_form() if self._execution else []
-        return [*get_form_fields(server_options), *get_candidate_form(), *execution_form, subtitle_form, source_credits()], {
+        gap_fields = [gap_form()] if self._gaps else []
+        return [*get_form_fields(server_options), *get_candidate_form(), *execution_form, *gap_fields, subtitle_form, source_credits()], {
                     "enabled": False, "notify": False, "interval_hours": 3, "retry_days": 7, "local_media_roots": "",
+                    **({"gap_enabled": False} if self._gaps else {}),
                     **FUSION_DEFAULTS, **copy.deepcopy(CANDIDATE_DEFAULTS),
                     **(copy.deepcopy(EXECUTION_DEFAULTS) if self._execution else {})}
 
@@ -760,4 +771,5 @@ class PtSubtitleFollowup(_PluginBase):
             if profile_status.get("binding_verified") and profile_status.get("enabled"):
                 execution_status["profile_name"] = profile_status.get("user_name")
             execution_page = render_execution(execution_status, self.__class__.__name__)
-        return [*execution_page, *overview, subtitles]
+        gap_page = [gap_panel(self._gaps.status())] if self._gaps and self._gaps.enabled else []
+        return [*execution_page, *gap_page, *overview, subtitles]

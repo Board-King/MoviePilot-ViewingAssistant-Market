@@ -15,6 +15,10 @@ fusion/execution_space.py
 fusion/execution_store.py
 fusion/execution_ui.py
 fusion/follow_context.py
+fusion/gap_host.py
+fusion/gap_search.py
+fusion/gap_ui.py
+fusion/gaps.py
 fusion/personal_discovery.py
 fusion/profile.py
 fusion/series_subscription.py
