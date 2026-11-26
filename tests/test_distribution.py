@@ -3,6 +3,8 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
+import runpy
 import shutil
 import tempfile
 import unittest
@@ -63,11 +65,20 @@ class DistributionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same release metadata"):
             build.package(write_v3=True)
 
+    def test_every_patch_offered_by_market_has_a_reviewed_native_adapter(self):
+        listing = json.loads((self.root / "package.v3.json").read_text(encoding="utf-8"))[build.PID]
+        interval = re.fullmatch(r">=(\d+\.\d+)\.(\d+),<=\1\.(\d+)", listing["system_version"])
+        self.assertIsNotNone(interval)
+        series, first, last = interval.groups()
+        offered = {f"v{series}.{patch}" for patch in range(int(first), int(last) + 1)}
+        runtime = runpy.run_path(str(self.plugin / "fusion/host_versions.py"))
+        self.assertEqual(offered, runtime["V3_VERSIONS"])
+
     def test_untested_host_ranges_or_free_threaded_runtime_are_rejected(self):
         self.update_v3(system_version=">=3.2.9")
         with self.assertRaisesRegex(ValueError, "host compatibility"):
             build.package(write_v3=True)
-        self.update_v3(system_version="==3.2.9", v3t=True)
+        self.update_v3(system_version=">=3.2.9,<=3.2.14", v3t=True)
         with self.assertRaisesRegex(ValueError, "runtime compatibility"):
             build.package(write_v3=True)
 

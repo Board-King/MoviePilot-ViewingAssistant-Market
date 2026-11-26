@@ -37,6 +37,28 @@ class GapHostTests(unittest.TestCase):
         self.assertIsNone(self.host._snapshot(sub, archived=False))
         self.host._inventory.assert_not_called()
 
+    def test_waiting_for_downloader_confirmation_protects_episodes_and_whole_season(self):
+        self.host.v3 = True
+        sub = NS(media_id="42", media_source="themoviedb", season=2)
+        pending = [object()]
+        self.host.downloads.list_pending_downloads.return_value = pending
+        covered = Mock(return_value=(False, frozenset({9, 10})))
+        modules = {
+            "app.application.download.pending": NS(pending_blocked_tv_scope=covered),
+            "app.schemas.media": NS(build_media_key=lambda provider, media_id: f"tmdb:{media_id}"),
+            "app.schemas.types": NS(MediaType=NS(TV=NS(value="电视剧"))),
+        }
+        with patch.dict(sys.modules, modules):
+            self.assertEqual(self.host._pending_episodes(sub), {9, 10})
+            self.host.downloads.list_pending_downloads.assert_called_once_with(target_keys=["电视剧:tmdb:42"])
+            covered.assert_called_once_with(pending, "电视剧:tmdb:42", 2)
+            covered.return_value = (True, frozenset())
+            with self.assertRaisesRegex(ValueError, "待确认"):
+                self.host._pending_episodes(sub)
+        # Earlier releases do not track pending submissions.
+        self.host.downloads = NS()
+        self.assertEqual(self.host._pending_episodes(sub), set())
+
     def test_scope_and_actual_manifest(self):
         self.assertEqual(_episodes("E09E11-E13"), {9,11,12,13})
         self.assertFalse(_episodes("E09-E01"))

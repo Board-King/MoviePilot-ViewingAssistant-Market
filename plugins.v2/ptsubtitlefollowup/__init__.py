@@ -112,7 +112,7 @@ class PtSubtitleFollowup(_PluginBase):
     plugin_name = "观影助手"
     plugin_desc = "按你的 Emby 口味，每天自动订阅电影和剧集。"
     plugin_icon = "https://raw.githubusercontent.com/Board-King/MoviePilot-ViewingAssistant-Market/main/icons/viewing-assistant.png"
-    plugin_version = "0.9.0"
+    plugin_version = "0.9.1"
     plugin_author = "Board-King"
     author_url = "https://github.com/Board-King"
     plugin_url = "https://github.com/Board-King/MoviePilot-ViewingAssistant-Market"

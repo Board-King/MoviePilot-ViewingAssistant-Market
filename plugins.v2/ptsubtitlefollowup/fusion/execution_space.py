@@ -16,6 +16,8 @@ import re
 import stat
 from urllib.parse import urlsplit
 
+from .host_versions import VERSION_V2, V3_VERSIONS
+
 
 MINIMUM_FREE_BYTES = 100 * 1024**3
 _LOCAL_FS = {"xfs", "ext4", "ext3", "btrfs", "zfs", "f2fs", "bcachefs", "fuse.shfs"}
@@ -213,7 +215,7 @@ def _destinations(directories, template, label, *, v3=False):
 
 
 def check_movie_download_space(directories, downloaders, template, *, storage_verified, probe=None,
-                               media_type="movie", host_version="v2.15.6"):
+                               media_type="movie", host_version=VERSION_V2):
     result = {"status": "unknown", "fingerprint": None, "locations_checked": 0,
               "minimum_free_bytes": MINIMUM_FREE_BYTES, "available_bytes": None}
     if storage_verified is not True:
@@ -223,10 +225,11 @@ def check_movie_download_space(directories, downloaders, template, *, storage_ve
             template = {}
         if not isinstance(template, dict) or not isinstance(downloaders, list) or not 1 <= len(downloaders) <= 32:
             raise ValueError
-        if host_version not in ("v2.15.6", "v3.2.9"):
+        v3 = host_version in V3_VERSIONS
+        if not v3 and host_version != VERSION_V2:
             raise ValueError
         roots = _destinations(directories, template, {"movie": "电影", "tv": "电视剧"}[media_type],
-                              v3=host_version == "v3.2.9")
+                              v3=v3)
         selected = template.get("downloader")
         choices = []
         names = set()
@@ -255,8 +258,10 @@ def check_movie_download_space(directories, downloaders, template, *, storage_ve
             locations.append([str(root), checked["mount"]])
             free.append(available)
         minimum = min(free)
+        # Existing grants bind this directory contract, not the host's patch number.
+        contract = "v3.2.9" if v3 else "v1"
         return {**result, "status": "ready" if minimum >= MINIMUM_FREE_BYTES else "low",
-                "fingerprint": _digest([f"{media_type}-download-space-" + ("v3.2.9" if host_version == "v3.2.9" else "v1"),
+                "fingerprint": _digest([f"{media_type}-download-space-{contract}",
                                         sorted(choices), locations, MINIMUM_FREE_BYTES]),
                 "locations_checked": len(roots), "available_bytes": minimum}
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError, IndexError, OverflowError):
@@ -268,11 +273,13 @@ def host_movie_download_space(*, storage_verified, systemconfig=None, media_type
     if storage_verified is True:
         try:
             from version import APP_VERSION
-            v3 = APP_VERSION == "v3.2.9"
+            v3 = APP_VERSION in V3_VERSIONS
             if v3:
                 from app.sdk.config import settings
-            else:
+            elif APP_VERSION == VERSION_V2:
                 from app.core.config import settings
+            else:
+                raise ValueError
             from app.schemas.types import SystemConfigKey
             if systemconfig is None:
                 if v3:

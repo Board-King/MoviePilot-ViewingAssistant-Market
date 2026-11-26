@@ -1,4 +1,4 @@
-"""Offline contracts for the V2 TMDB movie and TV season subscription adapter."""
+"""Offline contracts for the V2 and V3 movie and TV season subscription adapter."""
 from datetime import date
 from enum import Enum
 import importlib.util
@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1] / "plugins.v2" / "ptsubtitlefollowup" / "fusion"
@@ -136,7 +137,6 @@ class V3BoundaryTests(unittest.TestCase):
     def test_v3_native_call_uses_only_canonical_ids_and_never_defaults_tv_to_first_season(self):
         receiver, media, writes = self.receiver()
         native = object.__new__(host._MoviePilot)
-        native.version = host.V3_VERSION
         native.movie_type, native.tv_type = self.MediaType.MOVIE, self.MediaType.TV
         native.chain_type = lambda: receiver.chain
         native._detail = lambda *args: detail()
@@ -147,30 +147,53 @@ class V3BoundaryTests(unittest.TestCase):
             return proxy.subscription_repository.add(**self.request(proxy))
 
         native.native_add = add
-        self.assertEqual(native.add(TV, "FixtureOwner", lambda: True), (42, "新增订阅成功"))
-        self.assertEqual(calls[0]["season"], 2)
-        self.assertEqual(calls[0]["media_id"], "123")
-        self.assertNotIn("tmdbid", calls[0])
-        self.assertTrue(calls[0]["owner_scope"])
+        for version in host.V3_VERSIONS:
+            native.version = version
+            for target in (MOVIE, TV):
+                with self.subTest(version=version, kind=target["media_type"]):
+                    self.assertEqual(native.add(target, "FixtureOwner", lambda: True), (42, "新增订阅成功"))
+                    self.assertEqual(calls[-1]["season"], target["season"])
+                    self.assertEqual(calls[-1]["media_id"], "123")
+                    self.assertNotIn("tmdbid", calls[-1])
+                    self.assertTrue(calls[-1]["owner_scope"])
+
+    def test_only_reviewed_hosts_can_reach_native_write(self):
+        pinned = host._SOURCE_HASHES_BY_VERSION
+        self.assertEqual(pinned.keys(), host.V3_VERSIONS | {host.VERSION_V2})
+        for version in host.V3_VERSIONS:
+            self.assertEqual(len(pinned[version]), 10)
+        for version in ("v3.2.8", "v3.2.15", "v3.2.14rc1", "v3.3.0"):
+            with self.subTest(version=version), patch.dict(sys.modules, {"version": SimpleNamespace(APP_VERSION=version)}):
+                with self.assertRaisesRegex(ValueError, "Unsupported host version"):
+                    host._MoviePilot()
+
+    def test_reviewed_tag_with_a_different_subscription_module_is_rejected(self):
+        with patch.dict(sys.modules, {"version": SimpleNamespace(APP_VERSION="v3.2.14")}), \
+             patch("importlib.import_module", return_value=host):
+            with self.assertRaisesRegex(ValueError, "Unsupported host source"):
+                host._MoviePilot()
 
     def test_v3_namespaces_ignore_other_media_but_still_block_other_owners_and_history(self):
         native = FakeNative()
-        native.version = host.V3_VERSION
         adapter = host.HostSubscriptionAdapter(lambda: [SERVER], native_factory=lambda: native)
-        self.assertEqual(adapter.compatibility("FixtureOwner")["version"], host.V3_VERSION)
-        native.current = [row(type="音乐", media_source="musicbrainz", media_id="fixture", tmdbid=None),
-                          row(type="电视剧", season=2)]
-        self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "absent")
-        native.current.append(row(username="Other", tmdbid=None))
-        self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "conflict")
-        native.current, native.history = [], [row(tmdbid=None)]
-        self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "conflict")
+        for version in host.V3_VERSIONS:
+            with self.subTest(version=version):
+                native.version = version
+                self.assertEqual(adapter.compatibility("FixtureOwner")["version"], version)
+                native.history = []
+                native.current = [row(type="音乐", media_source="musicbrainz", media_id="fixture", tmdbid=None),
+                                  row(type="电视剧", season=2)]
+                self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "absent")
+                native.current.append(row(username="Other", tmdbid=None))
+                self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "conflict")
+                native.current, native.history = [], [row(tmdbid=None)]
+                self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "conflict")
 
     def test_v3_native_null_default_is_read_back_as_normal_subscription(self):
         # V3's create preset includes best_version=None, which explicitly
         # persists NULL rather than applying the ORM's default of zero.
         native = FakeNative()
-        native.version = host.V3_VERSION
+        native.version = "v3.2.14"
         adapter = host.HostSubscriptionAdapter(lambda: [SERVER], native_factory=lambda: native,
                                                 library_probe=lambda *args: "absent")
         for target in (MOVIE, TV):
@@ -185,7 +208,7 @@ class V3BoundaryTests(unittest.TestCase):
             native.history = [record]
             self.assertEqual(adapter.lookup_subscription(target, "FixtureOwner")["status"], "conflict")
             native.history = []
-        native.version = host.VERSION
+        native.version = host.VERSION_V2
         native.current = [row(best_version=None)]
         self.assertEqual(adapter.lookup_subscription(MOVIE, "FixtureOwner")["status"], "conflict")
 

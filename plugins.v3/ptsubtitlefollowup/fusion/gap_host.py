@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 from types import SimpleNamespace
 
+from .host_versions import VERSION_V2, V3_VERSIONS
 
 _VIDEO = {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts", ".strm", ".wmv", ".m4v", ".mpg", ".mpeg"}
 _SIDECAR = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".nfo", ".txt", ".jpg", ".jpeg", ".png", ".sfv"}
@@ -73,9 +74,9 @@ class GapHost:
         from ..host_compat import get_engine
         from app.chain.subscribe import SubscribeChain
         from app.chain.download import DownloadChain
-        if APP_VERSION not in {"v2.15.6", "v3.2.9"}:
+        self.v3 = APP_VERSION in V3_VERSIONS
+        if not self.v3 and APP_VERSION != VERSION_V2:
             raise ValueError("当前宿主版本未验证")
-        self.v3 = APP_VERSION == "v3.2.9"
         if self.v3:
             from app.domain.metainfo import MetaInfo
         else:
@@ -257,15 +258,29 @@ class GapHost:
             tasks[ep] = next(iter(hashes)) if len(hashes) == 1 and groups[ep] else None
         return original, groups, tasks, written, aliases
 
+    def _pending_episodes(self, sub):
+        # MP 3.2.12+ can accept a download before it appears in history or the downloader.
+        if not self.v3 or not hasattr(self.downloads, "list_pending_downloads"):
+            return set()
+        from app.application.download.pending import pending_blocked_tv_scope
+        from app.schemas.media import build_media_key
+        from app.schemas.types import MediaType
+        target = f"{MediaType.TV.value}:{build_media_key('themoviedb', _media_id(sub))}"
+        pending = self.downloads.list_pending_downloads(target_keys=[target])
+        whole, episodes = pending_blocked_tv_scope(pending, target, sub.season)
+        if whole:
+            raise ValueError("本季有待确认的整季下载")
+        return set(episodes)
+
     def _active(self, sub, args, written, aliases):
         # Cover current downloads AND completed tasks awaiting transfer. Removed files
         # are omitted. History without enough detail blocks the affected season.
         query = ("SELECT downloader,download_hash,episodes,seasons,torrent_name FROM downloadhistory "
                  "WHERE type='电视剧' AND " + self._identity_sql() + " ORDER BY id DESC LIMIT 4097")
+        active = self._pending_episodes(sub)
         rows = self._read(query, args)
         if len(rows) > _MAX_RECEIPTS:
             raise ValueError("下载历史超出可核实范围")
-        active = set()
         file_rows = self._read(
             "SELECT f.downloader,f.download_hash,f.filepath,f.state FROM downloadfiles f "
             "WHERE f.download_hash IN (SELECT download_hash FROM downloadhistory WHERE type='电视剧' AND " +

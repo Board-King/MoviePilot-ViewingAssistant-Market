@@ -18,28 +18,43 @@ import re
 import time
 import unicodedata
 
+from .host_versions import VERSION_V2, V3_VERSIONS
 
-VERSION = "v2.15.6"
-V3_VERSION = "v3.2.9"
 MAX_SUBSCRIPTIONS = 2048
 MAX_SERVERS = 8
-_SOURCE_HASHES = {
+_V2_HASHES = {
     "app.chain.subscribe": "acb32d818b2cb8bf8dec3062e1b9155595b2045b8de08aa7db3005f6d48b0f95",
     "app.db.subscribe_oper": "83c3c0f6d4a588a7a32b3fc67f343e89c8aa1545301c1553859316aa03bf9b2c",
     "app.db.models.subscribe": "efa92d87ca839f42e2f2c38f591dc0635c21ce93fe5cb5120cd0d261e694a67e",
 }
-_SOURCE_HASHES_BY_VERSION = {VERSION: _SOURCE_HASHES, V3_VERSION: {
+_V3_SHARED_HASHES = {
     "app.chain.subscribe": "c92ad9a45fcbed4619ec92d7fd108f8b98c2a439c7c2dd577c443665a06d8449",
     "app.chain.subscribe.create": "3576cfac8747736d3c85b6f7466b94816536a43fa9a7dfddda6ca3e1f7fb58e8",
     "app.chain.subscribe.facade": "638ae090211e8e8d5323ae7007bb75268466c00743336ba6815ce3ce1d229160",
     "app.chain.subscribe.identity": "6be3ae81c9e76cf1698de832adab632a77936809e4cec2166005ec3f2eb2a741",
-    "app.chain.subscribe.query": "40f46bd9ef4f100097ad0f948c220d460b5308152ce5202094e0e92f4d0291c3",
     "app.application.subscription.write": "2b6708cbdd6d1bd6d9d755ca9521229d2be7d739593c278825adf0b93cb35e00",
     "app.db.adapters.subscription": "8c7d1d08e6fb4df32fcdf7434e91cb4a4e151b6b778d5a31847651d042c1c713",
     "app.db.models.subscribe": "b6f3647e51fc307502cb35e42c7bff2d0661ff54e15fffff41c50e189ec18524",
     "app.db.models.subscribehistory": "2c9d7aa379df98c14f4baaa96ee945850ea452eaa17ae9f885256edec40673f2",
     "app.schemas.media": "c7f292ba6b8a6e4c790a89b077ff731f5fd431192430c955dba284b9c5b10253",
-}}
+}
+# The subscribe query owner changed independently of the creation transaction.
+# Pin each release to its shipped source, including read-only query changes.
+_QUERY_9 = "40f46bd9ef4f100097ad0f948c220d460b5308152ce5202094e0e92f4d0291c3"
+_QUERY_12 = "dc1edf4360590275448ffb2de9020d63b83b9325629d820d1830cff134b176f8"
+_V3_QUERY_HASHES = {
+    "v3.2.9": _QUERY_9,
+    "v3.2.10": _QUERY_9,
+    "v3.2.11": _QUERY_9,
+    "v3.2.12": _QUERY_12,
+    "v3.2.13": _QUERY_12,
+    "v3.2.14": "3e27f7114fa9a713f88f9d99e7841e9491bed399336138e286415a8253cdc5db",
+}
+_SOURCE_HASHES_BY_VERSION = {
+    VERSION_V2: _V2_HASHES,
+    **{version: {**_V3_SHARED_HASHES, "app.chain.subscribe.query": digest}
+       for version, digest in _V3_QUERY_HASHES.items()},
+}
 
 
 def _tmdb(value):
@@ -291,7 +306,7 @@ class _MoviePilot:
         self.movie_type, self.tv_type = MediaType.MOVIE, MediaType.TV
         add = self.chain_type.add
         parameters = inspect.signature(add).parameters
-        v3 = self.version == V3_VERSION
+        v3 = self.version in V3_VERSIONS
         required = {"title", "year", "mtype", "media_source", "media_id", "username",
                     "season", "episode_group", "message", "kwargs"}
         if not v3:
@@ -326,7 +341,7 @@ class _MoviePilot:
         with self.engine.connect() as connection:
             fields = [sub.id, sub.username, sub.type, sub.media_source, sub.media_id,
                       sub.season, sub.episode_group, sub.best_version]
-            if self.version == VERSION:
+            if self.version == VERSION_V2:
                 fields.extend((sub.mediaid, sub.tmdbid, sub.doubanid))
             rows = connection.execute(self.select(*fields).limit(MAX_SUBSCRIPTIONS + 1)).mappings().all()
             return [{"mediaid": None, "tmdbid": None, "doubanid": None, **row} for row in rows]
@@ -334,7 +349,7 @@ class _MoviePilot:
     @staticmethod
     def _detail(kind, media_id):
         from version import APP_VERSION
-        if APP_VERSION == V3_VERSION:
+        if APP_VERSION in V3_VERSIONS:
             from app.sdk.config import settings
         else:
             from app.core.config import settings
@@ -367,7 +382,7 @@ class _MoviePilot:
                 raise _NotSent("Aired season changed or unconfirmed")
             media_type = self.tv_type
             _permit(may_dispatch)
-        v3 = getattr(self, "version", VERSION) == V3_VERSION
+        v3 = getattr(self, "version", VERSION_V2) in V3_VERSIONS
         receiver = (_ExactRecognitionV3(self.chain_type(), identity, media_type, may_dispatch, owner) if v3
                     else _ExactRecognition(self.chain_type(), identity, media_type, may_dispatch))
         legacy_args = {} if v3 else {"tmdbid": int(identity["media_id"])}
@@ -584,7 +599,7 @@ class HostSubscriptionAdapter:
         if _owner_name(owner):
             try:
                 host = self._native()
-                result["version"] = getattr(host, "version", VERSION)
+                result["version"] = getattr(host, "version", VERSION_V2)
                 owner_key, host_key = host.owner_context(owner)
                 result.update(ready=True, owner_key=owner_key, host_key=host_key)
             except Exception:
@@ -596,7 +611,7 @@ class HostSubscriptionAdapter:
             try:
                 host = self._native()
                 external = self._external_ids if indexed_only else None
-                unified = getattr(host, "version", VERSION) == V3_VERSION
+                unified = getattr(host, "version", VERSION_V2) in V3_VERSIONS
                 current = _existing(host.subscriptions(), identity, owner, external_ids=external, unified=unified)
                 if current["status"] != "absent":
                     return current

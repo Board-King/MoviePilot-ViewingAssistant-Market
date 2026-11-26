@@ -5,6 +5,7 @@ import re
 from uuid import uuid4
 
 from .gap_host import release
+from .host_versions import VERSION_V2, V3_VERSIONS
 
 
 def _filters(params, include, snapshot, allow_backup):
@@ -67,7 +68,8 @@ def search_candidates(sub, snapshot, include_alternatives, allowed=lambda: True)
     media_id = snapshot["media_id"]
     if not allowed() or getattr(sub, "episode_group", None) or getattr(sub, "best_version", None):
         return []
-    if APP_VERSION == "v3.2.9":
+    v3 = APP_VERSION in V3_VERSIONS
+    if v3:
         from app.application.configuration import get_configured_system_config
         from app.application.subscription.sitebudget import SubscriptionSiteBudget
         from app.runtime.stop import runtime_stop_state
@@ -76,7 +78,7 @@ def search_candidates(sub, snapshot, include_alternatives, allowed=lambda: True)
         search.configure_subscription_site_budget(SubscriptionSiteBudget(
             repository=owner.subscription_search_repository, owner=f"viewing-assistant:{uuid4().hex}",
             cancelled=lambda: not allowed(), stop_state=runtime_stop_state))
-    elif APP_VERSION == "v2.15.6":
+    elif APP_VERSION == VERSION_V2:
         from app.db.systemconfig_oper import SystemConfigOper
         settings = SystemConfigOper()
         recognition = dict(source="themoviedb", mediaid=media_id, tmdbid=int(media_id))
@@ -86,7 +88,7 @@ def search_candidates(sub, snapshot, include_alternatives, allowed=lambda: True)
     if not _same_series(media, media_id, MediaType.TV):
         return []
     media = copy(media)
-    if APP_VERSION == "v3.2.9":
+    if v3:
         from app.chain.subscribe.metadata import apply_subscription_classification
         media = apply_subscription_classification(media, sub)
     media.season = snapshot["season"]
@@ -107,7 +109,7 @@ def search_candidates(sub, snapshot, include_alternatives, allowed=lambda: True)
     for context in contexts or []:
         offer = _offer(context, snapshot, MediaType.TV)
         if offer and (include_alternatives or offer["group"] == snapshot["group"]):
-            if APP_VERSION == "v2.15.6" and sub.media_category:
+            if not v3 and sub.media_category:
                 context.media_info = copy(context.media_info)
                 context.media_info.category = sub.media_category
             found.append((offer, context))

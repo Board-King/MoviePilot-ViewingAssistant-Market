@@ -1,16 +1,14 @@
 """Synthetic filesystem/mount and MP path contracts. Never inspect a real NAS."""
 import copy
-import importlib.util
 from pathlib import Path, PurePosixPath
 import stat
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-FILE = Path(__file__).resolve().parents[1] / "plugins.v2/ptsubtitlefollowup/fusion/execution_space.py"
-spec = importlib.util.spec_from_file_location("test_space_domain", FILE)
-space = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(space)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins.v2/ptsubtitlefollowup"))
+from fusion import execution_space as space
 MIN = space.MINIMUM_FREE_BYTES
 
 
@@ -90,6 +88,21 @@ class SpaceTests(unittest.TestCase):
         self.probed.clear()
         self.assertEqual(v3()["status"], "ready")
         self.assertEqual(set(self.probed), {"/array/general", "/media/movies", "/media/movies/sub"})
+
+    def test_reviewed_v3_patches_keep_existing_disk_grant(self):
+        for version in ("v3.2.9", "v3.2.10", "v3.2.11", "v3.2.12", "v3.2.13", "v3.2.14"):
+            with self.subTest(version=version):
+                result = space.check_movie_download_space(self.dirs, self.downloaders, None,
+                    storage_verified=True, probe=self.probe, host_version=version)
+                self.assertEqual(result["status"], "ready")
+                # This is the actual digest for this fixture in the 0.9.0 release.
+                self.assertEqual(result["fingerprint"],
+                    "cb6359b4328e3c77ef988cbb3467edbaab93cf48f48832eac7a5bf0a9acd7c94")
+        self.probed.clear()
+        result = space.check_movie_download_space(self.dirs, self.downloaders, None,
+            storage_verified=True, probe=self.probe, host_version="v3.2.999")
+        self.assertEqual(result["status"], "unknown")
+        self.assertFalse(self.probed)
 
     def test_v3_explicit_root_accounts_for_category_rank_and_type_subdirectory(self):
         self.dirs = [

@@ -6,7 +6,7 @@
 
 ## 安装
 
-支持 **MoviePilot V3 3.2.9 / V2 2.15.6**。用管理员账号打开「插件市场设置」，点击 **同步 Wiki**，回到插件市场搜索 **观影助手** 并安装。本插件源已由 MoviePilot Wiki 收录。[收录记录](https://github.com/jxxghp/MoviePilot-Wiki/pull/47)
+支持 **MoviePilot V3 3.2.9 至 3.2.14，以及 V2 2.15.6**。首次安装时，用管理员账号打开「插件市场设置」，点击 **同步 Wiki**，回到市场搜索 **观影助手**。已安装的用户可在插件市场检查更新。[收录记录](https://github.com/jxxghp/MoviePilot-Wiki/pull/47)
 
 也可以在市场设置中手动追加仓库地址。
 

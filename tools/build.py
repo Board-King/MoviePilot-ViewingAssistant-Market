@@ -36,11 +36,11 @@ def render_frontend():
 
 def release_listing():
     listings = {}
-    for generation, host in (("v2", "2.15.6"), ("v3", "3.2.9")):
+    for generation, supported_hosts in (("v2", "==2.15.6"), ("v3", ">=3.2.9,<=3.2.14")):
         entries = json.loads(source(ROOT / f"package.{generation}.json"))
         check(set(entries) == {PID}, f"Unexpected {generation} plugin index")
         listing = entries[PID]
-        check(listing.get("release") is True and listing.get("system_version") == f"=={host}",
+        check(listing.get("release") is True and listing.get("system_version") == supported_hosts,
               f"Review {generation} host compatibility before changing the release contract")
         if generation == "v2":
             check(listing.get("v3") is False, "V3 must use its own verified index")
